@@ -1,0 +1,17 @@
+# Simulation intermediate files (large, machine-generated — do not commit)
+/sim/
+/output/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# ngspice run artifacts
+*.nglog
+*.raw
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
