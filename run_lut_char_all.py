@@ -66,16 +66,17 @@ from scipy.io import savemat
 
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-SIM_DIR = Path("/home/cwang/lut_char/sim")
-OUT_DIR = Path("/home/cwang/lut_char/output")
+SIM_DIR   = Path("/home/cwang/lut_char/sim")
+OUT_DIR   = Path("/home/cwang/lut_char/output")
+STOP_FILE = Path("/home/cwang/lut_char/STOP")
 
 _SPICEINIT_SRC = Path(
     "/home/cwang/Book-on-gm-ID-design/starter_files_open_source_tools"
     "/ihp-sg13g2/simulation/.spiceinit"
 )
 
-# Number of parallel ngspice workers (leave one core free for Python/OS)
-N_WORKERS = max(1, (os.cpu_count() or 1))
+# Default parallel ngspice workers (all logical CPUs; override with --workers)
+N_WORKERS_DEFAULT = max(1, (os.cpu_count() or 1))
 
 
 # ── VDS non-uniform grid ───────────────────────────────────────────────────────
@@ -930,7 +931,7 @@ def _test_grids(cfg: DevCfg):
 
 # ── Main orchestrator ──────────────────────────────────────────────────────────
 
-def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False):
+def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False, max_workers=None):
     """
     Orchestrate PVT sweep, running (corner, temp) jobs in parallel.
 
@@ -957,8 +958,9 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False):
             for temp in temps
         ]
 
-    n_jobs   = len(jobs)
-    n_workers = min(n_jobs, N_WORKERS)
+    n_jobs    = len(jobs)
+    cap       = max_workers if max_workers is not None else N_WORKERS_DEFAULT
+    n_workers = min(n_jobs, cap)
 
     vgs_vec  = build_vgs_all(cfg.vgs_max)
     vds_all  = build_vds_all(cfg.vds_max)
@@ -981,10 +983,14 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False):
 
     if n_workers <= 1:
         for job in jobs:
+            if STOP_FILE.exists():
+                print("\n  [STOP] STOP file detected — aborting remaining jobs")
+                break
             _run_one_pvt(job)
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
             future_to_job = {pool.submit(_run_one_pvt, job): job for job in jobs}
+            stopped = False
             for fut in concurrent.futures.as_completed(future_to_job):
                 job = future_to_job[fut]
                 _, corner, temp, *_ = job
@@ -998,6 +1004,11 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False):
                         print(f"\n  [FAIL] {corner}/T{sign}{abs(temp)} — see log in {SIM_DIR}")
                 except Exception as exc:
                     print(f"\n  [EXC ] {corner}/T{sign}{abs(temp)} raised: {exc}")
+                if STOP_FILE.exists() and not stopped:
+                    stopped = True
+                    print("\n  [STOP] STOP file detected — cancelling pending jobs")
+                    for pending in future_to_job:
+                        pending.cancel()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -1031,7 +1042,14 @@ def main():
                     help="Slice of L indices to simulate, e.g. '0:6' for first 6 L values. "
                          "Partial .mat files get a _L{start}to{end}nm suffix and can be "
                          "combined with merge_mats.py. Enables distributing work across machines.")
+    ap.add_argument("--workers", type=int, default=None, metavar="N",
+                    help=f"Maximum parallel ngspice workers (default: all {N_WORKERS_DEFAULT} CPUs). "
+                         "Use a smaller value to leave cores free for other tasks.")
     args = ap.parse_args()
+
+    if STOP_FILE.exists():
+        print(f"  [WARN] Removing stale STOP file from previous run: {STOP_FILE}")
+        STOP_FILE.unlink()
 
     if args.list:
         print(f"\nAvailable devices  (CPU count: {os.cpu_count()}):\n")
@@ -1090,10 +1108,12 @@ def main():
         print(f"VDS: 60 fine (0–0.295V @5mV) + "
               f"{_n_vds_coarse(cfg.vds_max)} coarse = {len(vds_all)} pts")
         print(f"Corners: {corners}  Temps: {args.temps}  PVT jobs: {n_pvt}")
+        cap = args.workers if args.workers is not None else N_WORKERS_DEFAULT
         print(f"Simulations per job: {n_sim:,}  "
-              f"Workers: {min(n_pvt, N_WORKERS)}/{os.cpu_count()} CPUs")
+              f"Workers: {min(n_pvt, cap)}/{os.cpu_count()} CPUs")
 
-    run_pvt(cfg, corners, args.temps, l_vec=l_vec, test_mode=args.test_run)
+    run_pvt(cfg, corners, args.temps, l_vec=l_vec, test_mode=args.test_run,
+            max_workers=args.workers)
 
 
 if __name__ == "__main__":
