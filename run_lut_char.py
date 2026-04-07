@@ -51,7 +51,7 @@ from scipy.io import savemat
 
 # ── PDK / device constants ─────────────────────────────────────────────────────
 DEVICE    = "sky130_fd_pr__nfet_01v8"
-MODEL_LIB = "/home/cwang/apragma/models/sky130/models/sky130.lib.spice"
+MODEL_LIB = "/home/canswang/apragma/models/sky130/models/sky130.lib.spice"
 W_UM      = 5.0    # characterisation width (in bare µm units, no 'u' suffix)
 NFING     = 1
 
@@ -84,8 +84,8 @@ VGS_VEC_TEST = [0.6, 1.2]
 VSB_VEC_TEST = [0.0]
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-SIM_DIR = Path("/home/cwang/lut_char/sim")
-OUT_DIR = Path("/home/cwang/lut_char/output")
+SIM_DIR = Path("/home/canswang/lut_char/sim")
+OUT_DIR = Path("/home/canswang/lut_char/output")
 
 
 # ── Netlist generation ─────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@ echo ""
 
 for device in nfet_03v3 pfet_03v3 nfet_05v0 pfet_05v0; do
     exp=${EXPECTED[$device]}
-    files=($(ls /home/cwang/lut_char/sim/techsweep_${device}_*.txt 2>/dev/null))
+    files=($(ls /home/canswang/lut_char/sim/techsweep_${device}_*.txt 2>/dev/null))
     total_rows=0; n_files=${#files[@]}
     max_rows=0
     for f in "${files[@]}"; do
@@ -30,7 +30,7 @@ for device in nfet_03v3 pfet_03v3 nfet_05v0 pfet_05v0; do
         total_rows=$((total_rows + rows))
         [[ $rows -gt $max_rows ]] && max_rows=$rows
     done
-    mats=$(ls /home/cwang/lut_char/output/${device}_*.mat 2>/dev/null | wc -l)
+    mats=$(ls /home/canswang/lut_char/output/${device}_*.mat 2>/dev/null | wc -l)
     if [[ $n_files -gt 0 && $exp -gt 0 ]]; then
         pct=$(awk "BEGIN{printf \"%.1f\", $max_rows*100/$exp}")
         echo "  $device: $n_files active, $mats/15 .mat done, leading job ${pct}% (${max_rows}/${exp} rows)"
@@ -40,5 +40,5 @@ for device in nfet_03v3 pfet_03v3 nfet_05v0 pfet_05v0; do
 done
 
 echo ""
-echo "Output .mat files ($(ls /home/cwang/lut_char/output/*.mat 2>/dev/null | wc -l) total):"
-ls -lh /home/cwang/lut_char/output/*.mat 2>/dev/null | awk '{print "  "$9, $5}'
+echo "Output .mat files ($(ls /home/canswang/lut_char/output/*.mat 2>/dev/null | wc -l) total):"
+ls -lh /home/canswang/lut_char/output/*.mat 2>/dev/null | awk '{print "  "$9, $5}'

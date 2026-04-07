@@ -59,11 +59,10 @@ from scipy.io import savemat
 
 # ── PDK / device constants ─────────────────────────────────────────────────────
 DEVICE    = "sg13_lv_pmos"
-MODEL_LIB = ("/home/cwang/IHP-Open-PDK/ihp-sg13g2/libs.tech/ngspice/models"
+MODEL_LIB = ("/home/canswang/IHP-Open-PDK/ihp-sg13g2/libs.tech/ngspice/models"
              "/cornerMOSlv.lib")
 SPICEINIT_SRC = Path(
-    "/home/cwang/Book-on-gm-ID-design/starter_files_open_source_tools"
-    "/ihp-sg13g2/simulation/.spiceinit"
+    "/home/canswang/IHP-Open-PDK/ihp-sg13g2/libs.tech/ngspice/.spiceinit"
 )
 W_UM      = 5.0    # characterisation width (bare float, 'u' added in netlist)
 NFING     = 1
@@ -100,8 +99,8 @@ VGS_VEC_TEST = [0.6, 1.2]
 VSB_VEC_TEST = [0.0]
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-SIM_DIR = Path("/home/cwang/lut_char/sim")
-OUT_DIR = Path("/home/cwang/lut_char/output")
+SIM_DIR = Path("/home/canswang/lut_char/sim")
+OUT_DIR = Path("/home/canswang/lut_char/output")
 
 
 # ── Helper: L vector string with 'u' suffix (IHP has no scale=1u) ─────────────

@@ -5,7 +5,7 @@ run_lut_char_all.py — Unified non-uniform-VDS/VGS LUT characterization for all
 Covers 12 devices across three open-source PDKs:
   sky130  : nfet_01v8, pfet_01v8, nfet_01v8_lvt, pfet_01v8_lvt
   IHP     : sg13_lv_nmos, sg13_lv_pmos, sg13_hv_nmos, sg13_hv_pmos
-  GF180   : nfet_03v3, pfet_03v3, nfet_06v0, pfet_06v0
+  GF180   : nfet_03v3, pfet_03v3, nfet_05v0, pfet_05v0
 
 VGS grid (non-uniform) — better resolution in weak/moderate inversion
 --------------------------------------------------------------------
@@ -56,7 +56,7 @@ import concurrent.futures
 import os
 import subprocess
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -66,13 +66,12 @@ from scipy.io import savemat
 
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-SIM_DIR   = Path("/home/cwang/lut_char/sim")
-OUT_DIR   = Path("/home/cwang/lut_char/output")
-STOP_FILE = Path("/home/cwang/lut_char/STOP")
+SIM_DIR   = Path("/home/canswang/lut_char/sim")
+OUT_DIR   = Path("/home/canswang/lut_char/output")
+STOP_FILE = Path("/home/canswang/lut_char/STOP")
 
 _SPICEINIT_SRC = Path(
-    "/home/cwang/Book-on-gm-ID-design/starter_files_open_source_tools"
-    "/ihp-sg13g2/simulation/.spiceinit"
+    "/home/canswang/IHP-Open-PDK/ihp-sg13g2/libs.tech/ngspice/.spiceinit"
 )
 
 # Default parallel ngspice workers (all logical CPUs; override with --workers)
@@ -185,13 +184,13 @@ class DevCfg:
 
 
 # ── Model library paths ────────────────────────────────────────────────────────
-_SKY130_LIB    = "/home/cwang/apragma/models/sky130/models/sky130.lib.spice"
-_IHP_LV_LIB    = ("/home/cwang/IHP-Open-PDK/ihp-sg13g2/libs.tech/ngspice/"
+_SKY130_LIB    = "/home/canswang/apragma/models/sky130/models/sky130.lib.spice"
+_IHP_LV_LIB    = ("/home/canswang/IHP-Open-PDK/ihp-sg13g2/libs.tech/ngspice/"
                   "models/cornerMOSlv.lib")
-_IHP_HV_LIB    = ("/home/cwang/IHP-Open-PDK/ihp-sg13g2/libs.tech/ngspice/"
+_IHP_HV_LIB    = ("/home/canswang/IHP-Open-PDK/ihp-sg13g2/libs.tech/ngspice/"
                   "models/cornerMOShv.lib")
-_GF180_INCLUDE = "/home/cwang/apragma/models/gf180mcu/ngspice/design.ngspice"
-_GF180_LIB     = "/home/cwang/apragma/models/gf180mcu/ngspice/sm141064.ngspice"
+_GF180_INCLUDE = "/home/canswang/apragma/models/gf180mcu/ngspice/design.ngspice"
+_GF180_LIB     = "/home/canswang/apragma/models/gf180mcu/ngspice/sm141064.ngspice"
 
 # ── Corner maps ────────────────────────────────────────────────────────────────
 _SKY130_CM  = {"TT": "tt",     "FF": "ff",     "SS": "ss",     "SF": "sf",     "FS": "fs"}
@@ -221,6 +220,66 @@ _GF180_PFET_5V_L   = [0.50, 0.60, 0.70, 0.80, 0.90, 1.00, 2.00, 3.00]  # 8 pts
 
 # ── Device registry ────────────────────────────────────────────────────────────
 DEVICES = {
+    # ── GF180 3.3 V ────────────────────────────────────────────────────────────
+    # Non-DSS devices from fets_mm (no drain/source series resistors).
+    # Model: .lib sm141064 typical|ff|ss|sf|fs — each unified section bundles
+    # nfet_03v3_t + pfet_03v3_t + noise_corner + fets_mm automatically.
+    "gf180:nfet_03v3": DevCfg(
+        key="gf180:nfet_03v3", pdk="gf180", fet_type="nfet",
+        device="nfet_03v3",
+        model_lib=_GF180_LIB, lib_corner_map=_GF180_CM,
+        model_include=_GF180_INCLUDE,
+        has_explicit_u=True, contact_dist="0.18u",
+        l_vec=_GF180_3V3_L, vgs_max=3.3, vds_max=3.3,
+        vsb_vec=[0.0, -0.2, -0.4],
+        analysis="noise",
+        save_pfx="@m.xm1.m0",
+        save_nodes="g d b n",
+        caps_model="bsim4", gmb_col="gmbs", id_col="id",
+    ),
+    "gf180:pfet_03v3": DevCfg(
+        key="gf180:pfet_03v3", pdk="gf180", fet_type="pfet",
+        device="pfet_03v3",
+        model_lib=_GF180_LIB, lib_corner_map=_GF180_CM,
+        model_include=_GF180_INCLUDE,
+        has_explicit_u=True, contact_dist="0.18u",
+        l_vec=_GF180_3V3_L, vgs_max=3.3, vds_max=3.3,
+        vsb_vec=[0.0, -0.2, -0.4],
+        analysis="noise",
+        save_pfx="@m.xm1.m0",
+        save_nodes="g d b n",
+        caps_model="bsim4", gmb_col="gmbs", id_col="id",
+    ),
+    # ── GF180 5 V ──────────────────────────────────────────────────────────────
+    # nfet_05v0 / pfet_05v0: wrappers around the nfet_06v0/pfet_06v0 BSIM4 core
+    # that allow slightly shorter min L (0.60µm / 0.50µm).  Inner element is m0
+    # so save_pfx "@m.xm1.m0" is identical to the 3V3 devices.
+    "gf180:nfet_05v0": DevCfg(
+        key="gf180:nfet_05v0", pdk="gf180", fet_type="nfet",
+        device="nfet_05v0",
+        model_lib=_GF180_LIB, lib_corner_map=_GF180_CM,
+        model_include=_GF180_INCLUDE,
+        has_explicit_u=True, contact_dist="0.18u",
+        l_vec=_GF180_NFET_5V_L, vgs_max=5.0, vds_max=5.0,
+        vsb_vec=[0.0, -0.2, -0.4],
+        analysis="noise",
+        save_pfx="@m.xm1.m0",
+        save_nodes="g d b n",
+        caps_model="bsim4", gmb_col="gmbs", id_col="id",
+    ),
+    "gf180:pfet_05v0": DevCfg(
+        key="gf180:pfet_05v0", pdk="gf180", fet_type="pfet",
+        device="pfet_05v0",
+        model_lib=_GF180_LIB, lib_corner_map=_GF180_CM,
+        model_include=_GF180_INCLUDE,
+        has_explicit_u=True, contact_dist="0.18u",
+        l_vec=_GF180_PFET_5V_L, vgs_max=5.0, vds_max=5.0,
+        vsb_vec=[0.0, -0.2, -0.4],
+        analysis="noise",
+        save_pfx="@m.xm1.m0",
+        save_nodes="g d b n",
+        caps_model="bsim4", gmb_col="gmbs", id_col="id",
+    ),
     # ── sky130 ────────────────────────────────────────────────────────────────
     "sky130:nfet_01v8": DevCfg(
         key="sky130:nfet_01v8", pdk="sky130", fet_type="nfet",
@@ -326,66 +385,6 @@ DEVICES = {
         save_nodes="g d b n",
         caps_model="psp", gmb_col="gmb", id_col="ids",
     ),
-    # ── GF180 3.3 V ────────────────────────────────────────────────────────────
-    # Non-DSS devices from fets_mm (no drain/source series resistors).
-    # Model: .lib sm141064 typical|ff|ss|sf|fs — each unified section bundles
-    # nfet_03v3_t + pfet_03v3_t + noise_corner + fets_mm automatically.
-    "gf180:nfet_03v3": DevCfg(
-        key="gf180:nfet_03v3", pdk="gf180", fet_type="nfet",
-        device="nfet_03v3",
-        model_lib=_GF180_LIB, lib_corner_map=_GF180_CM,
-        model_include=_GF180_INCLUDE,
-        has_explicit_u=True, contact_dist="0.18u",
-        l_vec=_GF180_3V3_L, vgs_max=3.3, vds_max=3.3,
-        vsb_vec=[0.0, -0.2, -0.4],
-        analysis="noise",
-        save_pfx="@m.xm1.m0",
-        save_nodes="g d b n",
-        caps_model="bsim4", gmb_col="gmbs", id_col="id",
-    ),
-    "gf180:pfet_03v3": DevCfg(
-        key="gf180:pfet_03v3", pdk="gf180", fet_type="pfet",
-        device="pfet_03v3",
-        model_lib=_GF180_LIB, lib_corner_map=_GF180_CM,
-        model_include=_GF180_INCLUDE,
-        has_explicit_u=True, contact_dist="0.18u",
-        l_vec=_GF180_3V3_L, vgs_max=3.3, vds_max=3.3,
-        vsb_vec=[0.0, -0.2, -0.4],
-        analysis="noise",
-        save_pfx="@m.xm1.m0",
-        save_nodes="g d b n",
-        caps_model="bsim4", gmb_col="gmbs", id_col="id",
-    ),
-    # ── GF180 5 V ──────────────────────────────────────────────────────────────
-    # nfet_05v0 / pfet_05v0: wrappers around the nfet_06v0/pfet_06v0 BSIM4 core
-    # that allow slightly shorter min L (0.60µm / 0.50µm).  Inner element is m0
-    # so save_pfx "@m.xm1.m0" is identical to the 3V3 devices.
-    "gf180:nfet_05v0": DevCfg(
-        key="gf180:nfet_05v0", pdk="gf180", fet_type="nfet",
-        device="nfet_05v0",
-        model_lib=_GF180_LIB, lib_corner_map=_GF180_CM,
-        model_include=_GF180_INCLUDE,
-        has_explicit_u=True, contact_dist="0.18u",
-        l_vec=_GF180_NFET_5V_L, vgs_max=5.0, vds_max=5.0,
-        vsb_vec=[0.0, -0.2, -0.4],
-        analysis="noise",
-        save_pfx="@m.xm1.m0",
-        save_nodes="g d b n",
-        caps_model="bsim4", gmb_col="gmbs", id_col="id",
-    ),
-    "gf180:pfet_05v0": DevCfg(
-        key="gf180:pfet_05v0", pdk="gf180", fet_type="pfet",
-        device="pfet_05v0",
-        model_lib=_GF180_LIB, lib_corner_map=_GF180_CM,
-        model_include=_GF180_INCLUDE,
-        has_explicit_u=True, contact_dist="0.18u",
-        l_vec=_GF180_PFET_5V_L, vgs_max=5.0, vds_max=5.0,
-        vsb_vec=[0.0, -0.2, -0.4],
-        analysis="noise",
-        save_pfx="@m.xm1.m0",
-        save_nodes="g d b n",
-        caps_model="bsim4", gmb_col="gmbs", id_col="id",
-    ),
 }
 
 
@@ -409,7 +408,7 @@ def _build_save_lines(cfg: DevCfg) -> str:
     if cfg.caps_model == "bsim4":
         params = ["capbd", "capbs", "cdd", "cgb", "cgd", "cgdo",
                   "cgg", "cgs", "cgso", "css", "gds", "gm",
-                  cfg.gmb_col, cfg.id_col, "l", "vth"]
+                  cfg.gmb_col, cfg.id_col, "l", "vdsat", "vth"]
         noise_pfx = pfx[1:]    # strip leading '@' for onoise path
         noise_saves = (
             f".save onoise.{noise_pfx}.{cfg.id_col}\n"
@@ -694,6 +693,7 @@ def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
         return np.reshape(df[col].values[:expected], dims)
 
     # Composite capacitances
+    vdsat = None
     if cfg.caps_model == "bsim4":
         cgg = R('cgg') + R('cgdo') + R('cgso')
         cgb = -R('cgb')
@@ -703,6 +703,7 @@ def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
         css = R('css') + R('capbs') + R('cgso')
         sth = R('nid')**2
         sfl = R('n1overf')**2
+        vdsat = R('vdsat') if 'vdsat' in df.columns else None
     else:  # psp
         cgg = R('cgg') + R('cgdol') + R('cgsol')
         cgb = -R('cgb')
@@ -739,6 +740,8 @@ def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
         "STH":    sth,
         "SFL":    sfl,
     }
+    if vdsat is not None:
+        dic["VDSAT"] = vdsat
 
     dev_key  = cfg.device.replace('-', '_').replace(' ', '_')
     sign     = 'p' if temp >= 0 else 'm'
@@ -874,6 +877,11 @@ def _run_one_pvt(args):
     log_path     = str(SIM_DIR / f"techsweep_{dev_safe}_{tag}{l_suffix}.log")
     mat_path     = str(OUT_DIR / f"{dev_safe}_{tag}{l_suffix}.mat")
 
+    _p = Path(mat_path)
+    if _p.exists() and _p.stat().st_size > 0:
+        print(f"  [skip] {corner}/T{sign}{abs(temp)} — output exists: {mat_path}")
+        return (corner, temp, mat_path)
+
     # VGS vector for parse_and_save tensor reshape
     parse_vgs = list(vgs_override) if vgs_override is not None else list(build_vgs_all(cfg.vgs_max))
     vds_all   = build_vds_all(cfg.vds_max)
@@ -929,16 +937,32 @@ def _test_grids(cfg: DevCfg):
     return l_t, vgs_t, vsb_t
 
 
+def _smoke_grids(cfg: DevCfg):
+    """Return (l_vec, vgs_override, vsb_vec) for the ultra-fast smoke test.
+    Uses a single L (first), single VGS (near 60% of fine_max), and VSB=0.
+    """
+    l_vec = [cfg.l_vec[0]]
+    vgs_all = build_vgs_all(cfg.vgs_max)
+    n_fine  = _n_vgs_fine(cfg.vgs_max)
+    i_mid   = max(0, int(n_fine * 0.6) - 1)
+    vgs_vec = [float(vgs_all[i_mid])]
+    vsb_vec = [cfg.vsb_vec[0]]
+    return l_vec, vgs_vec, vsb_vec
+
+
 # ── Main orchestrator ──────────────────────────────────────────────────────────
 
-def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False, max_workers=None):
+def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
+            max_workers=None, corners_per_batch=1, smoke_mode=False):
     """
     Orchestrate PVT sweep, running (corner, temp) jobs in parallel.
 
-    l_vec     : L values to simulate (default: cfg.l_vec).  Pass a slice to
-                distribute L-range work across machines; use merge_mats.py to
-                combine the resulting partial .mat files afterward.
-    test_mode : run a micro-sweep (2L × 2VGS × 1VSB, TT/27°C) for validation.
+    l_vec            : L values to simulate (default: cfg.l_vec).  Pass a slice to
+                       distribute L-range work across machines; use merge_mats.py to
+                       combine the resulting partial .mat files afterward.
+    test_mode        : run a micro-sweep (2L × 2VGS × 1VSB, TT/27°C) for validation.
+    smoke_mode       : ultra-fast smoke test (1L × 1VGS × fullVDS × 1VSB, TT/27°C).
+    corners_per_batch: number of corners to run in each sequential batch.
     """
     if l_vec is None:
         l_vec = list(cfg.l_vec)
@@ -948,26 +972,12 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False, max_worker
     if cfg.pdk == "ihp":
         setup_spiceinit(cfg)
 
-    if test_mode:
-        l_t, vgs_t, vsb_t = _test_grids(cfg)
-        jobs = [(cfg, "TT", 27, l_t, vsb_t, vgs_t, True)]
-    else:
-        jobs = [
-            (cfg, corner, temp, l_vec, cfg.vsb_vec, None, False)
-            for corner in corners
-            for temp in temps
-        ]
-
-    n_jobs    = len(jobs)
-    cap       = max_workers if max_workers is not None else N_WORKERS_DEFAULT
-    n_workers = min(n_jobs, cap)
-
-    vgs_vec  = build_vgs_all(cfg.vgs_max)
-    vds_all  = build_vds_all(cfg.vds_max)
+    vgs_vec = build_vgs_all(cfg.vgs_max)
+    vds_all = build_vds_all(cfg.vds_max)
 
     print(f"\n{'='*68}")
     print(f"  Device : {cfg.device}  PDK : {cfg.pdk}")
-    if not test_mode:
+    if not test_mode and not smoke_mode:
         l_info = (f"{l_vec[0]}–{l_vec[-1]}µm ({len(l_vec)} pts"
                   + (f", partial {len(l_vec)}/{len(cfg.l_vec)})" if len(l_vec) < len(cfg.l_vec) else ")"))
         print(f"  L      : {l_info}")
@@ -978,37 +988,62 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False, max_worker
         print(f"  VDS    : 60 fine pts (0–0.295V @5mV) + "
               f"{_n_vds_coarse(cfg.vds_max)} coarse pts = "
               f"{len(vds_all)} total")
-        print(f"  Jobs   : {n_jobs}  Workers : {n_workers} / {os.cpu_count()} CPUs")
+        n_pvt = len(corners) * len(temps)
+        cap_disp = max_workers if max_workers is not None else N_WORKERS_DEFAULT
+        print(f"  Jobs   : {n_pvt}  Workers/batch : {min(len(temps)*corners_per_batch, cap_disp)} / {os.cpu_count()} CPUs")
+        print(f"  Batches: {corners_per_batch} corner(s)/batch")
     print(f"{'='*68}")
 
-    if n_workers <= 1:
-        for job in jobs:
-            if STOP_FILE.exists():
-                print("\n  [STOP] STOP file detected — aborting remaining jobs")
-                break
-            _run_one_pvt(job)
+    # Build batch list
+    if test_mode:
+        l_t, vgs_t, vsb_t = _test_grids(cfg)
+        batches = [("test", [(cfg, "TT", 27, l_t, vsb_t, vgs_t, True)])]
+    elif smoke_mode:
+        l_s, vgs_s, vsb_s = _smoke_grids(cfg)
+        batches = [("smoke", [(cfg, "TT", 27, l_s, vsb_s, vgs_s, False)])]
     else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
-            future_to_job = {pool.submit(_run_one_pvt, job): job for job in jobs}
-            stopped = False
-            for fut in concurrent.futures.as_completed(future_to_job):
-                job = future_to_job[fut]
-                _, corner, temp, *_ = job
-                sign = 'p' if temp >= 0 else 'm'
-                try:
-                    result = fut.result()
-                    if result is not None:
-                        c, t, mat_path = result
-                        print(f"\n  [done] {c}/T{sign}{abs(t)} → {mat_path}")
-                    else:
-                        print(f"\n  [FAIL] {corner}/T{sign}{abs(temp)} — see log in {SIM_DIR}")
-                except Exception as exc:
-                    print(f"\n  [EXC ] {corner}/T{sign}{abs(temp)} raised: {exc}")
-                if STOP_FILE.exists() and not stopped:
-                    stopped = True
-                    print("\n  [STOP] STOP file detected — cancelling pending jobs")
-                    for pending in future_to_job:
-                        pending.cancel()
+        corner_batches = [corners[i:i+corners_per_batch]
+                          for i in range(0, len(corners), corners_per_batch)]
+        batches = [
+            (batch_corners, [
+                (cfg, corner, temp, l_vec, cfg.vsb_vec, None, False)
+                for corner in batch_corners
+                for temp in temps
+            ])
+            for batch_corners in corner_batches
+        ]
+
+    n_batches = len(batches)
+    for batch_idx, (batch_label, jobs) in enumerate(batches):
+        if STOP_FILE.exists():
+            print("\n  [STOP] STOP file detected — aborting remaining batches")
+            break
+
+        if not test_mode and not smoke_mode:
+            print(f"\n  Batch {batch_idx+1}/{n_batches}: corners={list(batch_label)}")
+
+        cap       = max_workers if max_workers is not None else N_WORKERS_DEFAULT
+        n_workers = min(len(jobs), cap)
+
+        if n_workers <= 1:
+            for job in jobs:
+                _run_one_pvt(job)
+        else:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
+                future_to_job = {pool.submit(_run_one_pvt, job): job for job in jobs}
+                for fut in concurrent.futures.as_completed(future_to_job):
+                    job = future_to_job[fut]
+                    _, corner, temp, *_ = job
+                    sign = 'p' if temp >= 0 else 'm'
+                    try:
+                        result = fut.result()
+                        if result is not None:
+                            c, t, mat_path = result
+                            print(f"\n  [done] {c}/T{sign}{abs(t)} → {mat_path}")
+                        else:
+                            print(f"\n  [FAIL] {corner}/T{sign}{abs(temp)} — see log in {SIM_DIR}")
+                    except Exception as exc:
+                        print(f"\n  [EXC ] {corner}/T{sign}{abs(temp)} raised: {exc}")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -1033,6 +1068,9 @@ def main():
                     help="Device key, e.g. sky130:nfet_01v8")
     ap.add_argument("--test-run", action="store_true",
                     help="Micro-sweep validation (2 L, 2 VGS, 1 VSB, TT/27°C)")
+    ap.add_argument("--smoke", action="store_true",
+                    help="Ultra-fast smoke test: 1L × 1VGS × fullVDS × 1VSB, TT/27°C. "
+                         "Verifies the pipeline runs end-to-end; no validation output.")
     ap.add_argument("--corners", nargs="+", metavar="CORNER",
                     help="Override corners (default: all available for device)")
     ap.add_argument("--temps", nargs="+", type=int, default=ALL_TEMPS,
@@ -1045,6 +1083,15 @@ def main():
     ap.add_argument("--workers", type=int, default=None, metavar="N",
                     help=f"Maximum parallel ngspice workers (default: all {N_WORKERS_DEFAULT} CPUs). "
                          "Use a smaller value to leave cores free for other tasks.")
+    ap.add_argument("--corners-per-batch", type=int, default=1, choices=[1, 2],
+                    metavar="N",
+                    help="Number of corners to simulate in each sequential batch "
+                         "(default: 1). Each batch runs corner×temp jobs in parallel "
+                         "(1→3 workers max, 2→6 workers max).")
+    ap.add_argument("--vsb-points", type=int, default=None, metavar="N",
+                    help="Override vsb_vec with N evenly spaced points from 0 to -VDD "
+                         "(e.g. 5 gives [0, -VDD/4, ..., -VDD]). "
+                         "Default: use each device's built-in vsb_vec.")
     args = ap.parse_args()
 
     if STOP_FILE.exists():
@@ -1063,57 +1110,80 @@ def main():
                   f"corners={list(c.lib_corner_map.keys())}")
         return
 
-    if not args.device:
-        ap.error("--device is required (or use --list to see options)")
-
-    if args.device not in DEVICES:
-        ap.error(f"Unknown device '{args.device}'. Use --list to see available keys.")
-
-    cfg = DEVICES[args.device]
-
-    # Determine corners
-    available = list(cfg.lib_corner_map.keys())
-    if args.corners:
-        bad = [c for c in args.corners if c not in available]
-        if bad:
-            ap.error(f"Corner(s) {bad} not available for {cfg.key}. "
-                     f"Available: {available}")
-        corners = args.corners
+    if args.device:
+        if args.device not in DEVICES:
+            ap.error(f"Unknown device '{args.device}'. Use --list to see available keys.")
+        device_keys = [args.device]
     else:
-        corners = available
+        device_keys = list(DEVICES.keys())
 
-    # Determine L vector (full or sliced via --l-range)
-    l_vec = list(cfg.l_vec)
-    if args.l_range:
-        try:
-            s, e = (int(x) for x in args.l_range.split(":"))
-        except ValueError:
-            ap.error("--l-range must be START:STOP integers, e.g. '0:6'")
-        l_vec = l_vec[s:e]
-        if not l_vec:
-            ap.error(f"--l-range {args.l_range} produced an empty L list for {cfg.key} "
-                     f"(has {len(cfg.l_vec)} L values)")
+    n_devices = len(device_keys)
+    for dev_idx, dev_key in enumerate(device_keys):
+        if STOP_FILE.exists():
+            print("\n[STOP] STOP file detected — aborting remaining devices")
+            break
 
-    if not args.test_run:
-        vgs_all = build_vgs_all(cfg.vgs_max)
-        vds_all = build_vds_all(cfg.vds_max)
-        n_pvt   = len(corners) * len(args.temps)
-        n_sim   = len(l_vec) * len(vgs_all) * len(vds_all) * len(cfg.vsb_vec)
-        l_info  = (f"{l_vec[0]}–{l_vec[-1]}µm ({len(l_vec)} pts"
-                   + (f", partial {len(l_vec)}/{len(cfg.l_vec)})" if args.l_range else ")"))
-        print(f"\nPDK: {cfg.pdk}  Device: {cfg.device}")
-        print(f"L:   {l_info}")
-        print(f"VGS: {_n_vgs_fine(cfg.vgs_max)} fine (0–{_vgs_fine_max(cfg.vgs_max):.2f}V @10mV) + "
-              f"{_n_vgs_coarse(cfg.vgs_max)} coarse = {len(vgs_all)} pts")
-        print(f"VDS: 60 fine (0–0.295V @5mV) + "
-              f"{_n_vds_coarse(cfg.vds_max)} coarse = {len(vds_all)} pts")
-        print(f"Corners: {corners}  Temps: {args.temps}  PVT jobs: {n_pvt}")
-        cap = args.workers if args.workers is not None else N_WORKERS_DEFAULT
-        print(f"Simulations per job: {n_sim:,}  "
-              f"Workers: {min(n_pvt, cap)}/{os.cpu_count()} CPUs")
+        cfg = DEVICES[dev_key]
 
-    run_pvt(cfg, corners, args.temps, l_vec=l_vec, test_mode=args.test_run,
-            max_workers=args.workers)
+        if args.vsb_points is not None:
+            if args.vsb_points < 1:
+                ap.error("--vsb-points must be >= 1")
+            vsb_new = [round(v, 4)
+                       for v in np.linspace(0.0, -cfg.vgs_max, args.vsb_points).tolist()]
+            cfg = replace(cfg, vsb_vec=vsb_new)
+
+        if n_devices > 1:
+            print(f"\n{'='*60}")
+            print(f"  Device {dev_idx+1}/{n_devices}: {dev_key}")
+            print(f"{'='*60}")
+
+        # Determine corners
+        if args.corners:
+            available = set(cfg.lib_corner_map.keys())
+            corners = [c for c in args.corners if c in available]
+            if not corners:
+                print(f"  [SKIP] {dev_key}: no overlap between requested corners "
+                      f"{args.corners} and available {list(cfg.lib_corner_map.keys())}")
+                continue
+        else:
+            corners = list(cfg.lib_corner_map.keys())
+
+        # Determine L vector (full or sliced via --l-range)
+        l_vec = list(cfg.l_vec)
+        if args.l_range:
+            try:
+                s, e = (int(x) for x in args.l_range.split(":"))
+            except ValueError:
+                ap.error("--l-range must be START:STOP integers, e.g. '0:6'")
+            l_vec = l_vec[s:e]
+            if not l_vec:
+                ap.error(f"--l-range {args.l_range} produced an empty L list for {cfg.key} "
+                         f"(has {len(cfg.l_vec)} L values)")
+
+        if not args.test_run and not args.smoke:
+            vgs_all = build_vgs_all(cfg.vgs_max)
+            vds_all = build_vds_all(cfg.vds_max)
+            n_pvt   = len(corners) * len(args.temps)
+            n_sim   = len(l_vec) * len(vgs_all) * len(vds_all) * len(cfg.vsb_vec)
+            l_info  = (f"{l_vec[0]}–{l_vec[-1]}µm ({len(l_vec)} pts"
+                       + (f", partial {len(l_vec)}/{len(cfg.l_vec)})" if args.l_range else ")"))
+            print(f"\nPDK: {cfg.pdk}  Device: {cfg.device}")
+            print(f"L:   {l_info}")
+            print(f"VGS: {_n_vgs_fine(cfg.vgs_max)} fine (0–{_vgs_fine_max(cfg.vgs_max):.2f}V @10mV) + "
+                  f"{_n_vgs_coarse(cfg.vgs_max)} coarse = {len(vgs_all)} pts")
+            print(f"VDS: 60 fine (0–0.295V @5mV) + "
+                  f"{_n_vds_coarse(cfg.vds_max)} coarse = {len(vds_all)} pts")
+            print(f"VSB: {len(cfg.vsb_vec)} pts  {cfg.vsb_vec}")
+            print(f"Corners: {corners}  Temps: {args.temps}  PVT jobs: {n_pvt}")
+            cap = args.workers if args.workers is not None else N_WORKERS_DEFAULT
+            print(f"Simulations per job: {n_sim:,}  "
+                  f"Workers: {min(n_pvt, cap)}/{os.cpu_count()} CPUs")
+
+        run_pvt(cfg, corners, args.temps, l_vec=l_vec,
+                test_mode=args.test_run,
+                smoke_mode=args.smoke,
+                max_workers=args.workers,
+                corners_per_batch=args.corners_per_batch)
 
 
 if __name__ == "__main__":
