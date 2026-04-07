@@ -477,7 +477,17 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
     """
     lib_corner   = cfg.lib_corner_map[corner]
     l_str        = _l_str(l_vec, cfg.has_explicit_u)
-    vsb_str      = _vec_str(vsb_vec, ".3f")
+    # ngspice's `compose values` stops parsing at the first negative token.
+    # Use start/stop/step form (which handles negatives correctly) for multi-point VSB,
+    # and plain `values` only for the single-point (VSB=0) case.
+    if len(vsb_vec) == 1:
+        vsb_compose = f"compose vsb_vec values {vsb_vec[0]:.4f}"
+    else:
+        vsb_start = vsb_vec[0]
+        vsb_step  = vsb_vec[1] - vsb_vec[0]          # e.g. -0.2 or -0.4714
+        vsb_stop  = vsb_vec[-1] + vsb_step * 0.01    # tiny overshoot ensures last point included
+        vsb_compose = (f"compose vsb_vec start={vsb_start:.4f} "
+                       f"stop={vsb_stop:.6f} step={vsb_step:.6f}")
     _, _, vds_ng_stop  = _VDS_COARSE_CFG[cfg.vds_max]
     vds_cs       = _VDS_COARSE_CFG[cfg.vds_max][0]
     save_lines   = _build_save_lines(cfg)
@@ -549,7 +559,7 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
         "set wr_vecnames",
         "",
         f"compose l_vec   values {l_str}",
-        f"compose vsb_vec values {vsb_str}",
+        vsb_compose,
         f"* Fine VDS (0–0.295V @5mV, 60 pts)",
         f"compose vd_fine_vec   start=0   stop=0.2951       step=0.005",
         f"* Coarse VDS (0.3–{cfg.vds_max}V @{vds_cs}V, {_n_vds_coarse(cfg.vds_max)} pts)",
@@ -939,14 +949,14 @@ def _test_grids(cfg: DevCfg):
 
 def _smoke_grids(cfg: DevCfg):
     """Return (l_vec, vgs_override, vsb_vec) for the ultra-fast smoke test.
-    Uses a single L (first), single VGS (near 60% of fine_max), and VSB=0.
+    Uses a single L (first), single VGS (near 60% of fine_max), full vsb_vec.
     """
     l_vec = [cfg.l_vec[0]]
     vgs_all = build_vgs_all(cfg.vgs_max)
     n_fine  = _n_vgs_fine(cfg.vgs_max)
     i_mid   = max(0, int(n_fine * 0.6) - 1)
     vgs_vec = [float(vgs_all[i_mid])]
-    vsb_vec = [cfg.vsb_vec[0]]
+    vsb_vec = list(cfg.vsb_vec)
     return l_vec, vgs_vec, vsb_vec
 
 
