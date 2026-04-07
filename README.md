@@ -26,6 +26,7 @@ SPICE operating points over a non-uniform (VGS, VDS) grid and saving results as
 - **ngspice** ≥ 41 (with BSIM4 noise support)
 - **Python** ≥ 3.9
 - Python packages: `numpy`, `scipy`
+- For NetCDF4 export (`merge_to_nc.py`): `xarray`, `netCDF4`
 
 PDK model paths are configured at the top of `run_lut_char_all.py`.
 
@@ -35,7 +36,7 @@ PDK model paths are configured at the top of `run_lut_char_all.py`.
 # List all devices and their grid sizes
 python run_lut_char_all.py --list
 
-# Ultra-fast smoke test — end-to-end check, no validation (~10–30 s)
+# Ultra-fast smoke test — end-to-end check, no validation (~10–30 s per VSB point)
 python run_lut_char_all.py --device gf180:nfet_03v3 --smoke
 
 # Validate a device with a micro-sweep (fast, ~2 min)
@@ -54,11 +55,14 @@ python run_lut_char_all.py --device gf180:nfet_03v3 --corners-per-batch 1
 # Run all devices sequentially (omit --device)
 python run_lut_char_all.py --corners-per-batch 1
 
-# Monitor progress of running simulations
+# Monitor progress of running simulations (per-corner, per-temperature)
 bash monitor.sh
 
-# Full-range VSB sweep with 5 points (0 → −VDD)
-python run_lut_char_all.py --device gf180:nfet_03v3 --vsb-points 5
+# Full-range VSB sweep with 8 points (0 → −VDD)
+python run_lut_char_all.py --device gf180:nfet_03v3 --vsb-points 8
+
+# Merge all per-(corner, temp) .mat files into a single labelled NetCDF4 file
+python merge_to_nc.py --input-dir output/ --output-dir output/
 ```
 
 ## Voltage Grid
@@ -79,22 +83,22 @@ Use `--vsb-points N` to override with N evenly spaced points spanning the full 0
 # 5 pts on a 1.8 V device → [0.0, -0.45, -0.9, -1.35, -1.8]
 python run_lut_char_all.py --device sky130:nfet_01v8 --vsb-points 5
 
-# 4 pts on a 3.3 V device → [0.0, -1.1, -2.2, -3.3]
-python run_lut_char_all.py --device ihp:sg13_hv_nmos --vsb-points 4
+# 8 pts on a 3.3 V device → [0.0, -0.471, -0.943, …, -3.3]
+python run_lut_char_all.py --device gf180:nfet_03v3 --vsb-points 8
 ```
 
 ## Test Modes
 
 Three modes are available for validating and profiling the pipeline before committing to a full run:
 
-| Flag | L | VGS | Temps | Corners | Validates? | Approx time |
-|------|---|-----|-------|---------|------------|-------------|
-| `--smoke` | 1 | 1 | 27°C | TT | No | ~10–30 s |
-| `--test-run` | 2 | 2 | 27°C | TT | Yes (TC1–4) | ~1–5 min |
-| *(full run)* | all | all | 3 | all 5 | No | hours–days |
+| Flag | L | VGS | VSB | Temps | Corners | Validates? | Approx time |
+|------|---|-----|-----|-------|---------|------------|-------------|
+| `--smoke` | 1 | 1 | all (respects `--vsb-points`) | 27°C | TT | No | ~10–30 s × nVSB |
+| `--test-run` | 2 | 2 | VSB=0 only | 27°C | TT | Yes (TC1–4) | ~1–5 min |
+| *(full run)* | all | all | all | 3 | all 5 | No | hours–days |
 
-- **`--smoke`**: single ngspice call; confirms the pipeline runs end-to-end without crashing.
-- **`--test-run`**: micro-sweep with TC validation checks (transconductance continuity, noise floor, etc.).
+- **`--smoke`**: one ngspice call per VSB point; confirms the pipeline runs end-to-end without crashing. Uses the full `vsb_vec` so `--vsb-points` is exercised.
+- **`--test-run`**: micro-sweep (VSB=0 only) with TC validation checks (transconductance continuity, noise floor, etc.).
 
 ## Concurrency Control
 
@@ -122,7 +126,33 @@ Batch 5/5: [FS] → 3 parallel jobs                           ← wait
 
 A STOP file (`touch STOP` in the working directory) halts execution between batches; any batch already in progress finishes cleanly. When `--device` is omitted, all devices run sequentially and the STOP file is also checked between devices.
 
+## Progress Monitoring
+
+`monitor.sh` shows live per-corner, per-temperature progress for all GF180 devices.
+It auto-detects the VSB point count from the running netlists so percentages are always accurate:
+
+```
+22:58:04 — Active ngspice: 3 processes
+
+  nfet_03v3  [3/15 done, nVSB=8]
+    TT   ✓ done
+    FF   ▶ active — Tm40:65% Tp27:62% Tp125:71%
+    SS     waiting
+    SF     waiting
+    FS     waiting
+```
+
+```bash
+# Run once
+bash monitor.sh
+
+# Poll every 60 s
+watch -n 60 bash monitor.sh
+```
+
 ## Output Format
+
+### Per-PVT `.mat` files
 
 Each completed PVT job writes one `.mat` file to `output/`:
 
@@ -145,6 +175,42 @@ Inside each `.mat`, a single struct named after the device contains:
 | `SFL` | (nL, nVGS, nVDS, nVSB) | Flicker noise PSD |
 | `VDSAT` | (nL, nVGS, nVDS, nVSB) | Saturation voltage (BSIM4 devices only) |
 | `VGS/VDS/VSB/L` | vectors | Axis coordinates |
+
+### Per-device `.nc` NetCDF4 file (xarray)
+
+`merge_to_nc.py` merges all per-(corner, temp) `.mat` files for a device into a
+single labelled NetCDF4 file suitable for analysis with xarray/dask:
+
+```bash
+python merge_to_nc.py --input-dir output/ --output-dir output/
+# → output/nfet_03v3.nc, output/pfet_03v3.nc, …
+
+# Filter to a single device
+python merge_to_nc.py --device nfet_03v3
+```
+
+The resulting dataset has CORNER and TEMP as first-class dimensions:
+
+```python
+import xarray as xr
+ds = xr.open_dataset("output/nfet_03v3.nc")
+# <xarray.Dataset>
+# Dimensions:  (corner: 5, temp: 3, L: 12, VGS: 187, VDS: 91, VSB: 8)
+# Coordinates:
+#   * corner   (corner) <U2  'TT' 'FF' 'SS' 'SF' 'FS'
+#   * temp     (temp)   int64  -40  27  125
+#   * L        (L)      float64  0.28 … 3.0   [µm]
+#   * VGS      (VGS)    float64  0.0  … 3.3   [V]
+#   * VDS      (VDS)    float64  0.0  … 3.3   [V]
+#   * VSB      (VSB)    float64  0.0  … 3.3   [V, abs]
+
+# Select a slice
+ids = ds["ID"].sel(corner="TT", temp=27)        # shape (12, 187, 91, 8)
+gm_ff_hot = ds["GM"].sel(corner="FF", temp=125) # shape (12, 187, 91, 8)
+```
+
+Missing (corner, temp) combinations are filled with `NaN`; variables absent from
+all files (e.g. `VDSAT` on IHP devices) are dropped automatically.
 
 ## Distributed Computation
 
