@@ -1,8 +1,15 @@
 # LUT Characterization Pipeline
 
 Generates gm/ID design lookup tables (LUTs) for open-source PDKs by sweeping
-SPICE operating points over a non-uniform (VGS, VDS) grid and saving results as
+SPICE operating points over a configurable (VGS, VDS) grid and saving results as
 `.mat` files compatible with the [gm/ID design methodology].
+
+Two grid modes are supported:
+- **Non-uniform** (default): fine 10 mV / 5 mV steps near 0 V to capture weak/moderate
+  inversion, coarser 25–100 mV steps at higher voltages.
+- **Uniform** (`--uniform-grid`): simple 25 mV step for both VGS and VDS across the full
+  range. Outputs go into separate `sim/uniform/` and `output/uniform/` subdirectories so
+  both grid types can coexist without overwriting each other.
 
 ## Supported PDKs and Devices
 
@@ -55,17 +62,31 @@ python run_lut_char_all.py --device gf180:nfet_03v3 --corners-per-batch 1
 # Run all devices sequentially (omit --device)
 python run_lut_char_all.py --corners-per-batch 1
 
+# Run all IHP devices only
+python run_lut_char_all.py --node ihp --corners-per-batch 1
+
 # Monitor progress of running simulations (per-corner, per-temperature)
 bash monitor.sh
 
 # Full-range VSB sweep with 8 points (0 → −VDD)
 python run_lut_char_all.py --device gf180:nfet_03v3 --vsb-points 8
 
+# Uniform 25 mV grid (outputs go to sim/uniform/ and output/uniform/)
+python run_lut_char_all.py --device gf180:nfet_03v3 --uniform-grid
+python run_lut_char_all.py --device gf180:nfet_03v3 --uniform-grid --corners TT
+python run_lut_char_all.py --device gf180:nfet_03v3 --uniform-grid --smoke
+
+# Save outputs to a different disk (e.g. external drive)
+python run_lut_char_all.py --device gf180:nfet_03v3 --output-dir /mnt/data/lut_output
+python run_lut_char_all.py --device gf180:nfet_03v3 --output-dir /mnt/data/lut_output --sim-dir /mnt/data/lut_sim
+
 # Merge all per-(corner, temp) .mat files into a single labelled NetCDF4 file
 python merge_to_nc.py --input-dir output/ --output-dir output/
 ```
 
 ## Voltage Grid
+
+### Non-uniform grid (default)
 
 Each device uses a non-uniform VGS and VDS grid to capture weak/moderate/strong
 inversion transitions with high resolution at low voltages and coarser steps in
@@ -75,6 +96,44 @@ strong inversion:
 |--------|----------|----------|
 | Fine (0 → ~½·VGS_max) | 10 mV | 5 mV (0–0.295 V) |
 | Coarse (½·VGS_max → VGS_max) | 25–100 mV | 50–100 mV |
+
+Total point counts by device supply voltage:
+
+| VGS_max | nVGS (non-uniform) | nVDS (non-uniform) |
+|---------|--------------------|--------------------|
+| 1.2 V   | 91                 | 79                 |
+| 1.8 V   | 126                | 91                 |
+| 3.3 V   | 187                | 91                 |
+| 5.0 V   | 231                | 108                |
+
+### Uniform grid (`--uniform-grid`)
+
+Replaces both grids with a simple 25 mV uniform step from 0 V to VGS_max / VDS_max.
+The VSB sweep is unchanged.
+
+| VGS_max / VDS_max | nVGS = nVDS (uniform @25 mV) |
+|-------------------|------------------------------|
+| 1.2 V             | 49                           |
+| 1.8 V             | 73                           |
+| 3.3 V             | 133                          |
+| 5.0 V             | 201                          |
+
+Output files are written to **`sim/uniform/`** and **`output/uniform/`** so they never
+overwrite a non-uniform run:
+
+```
+sim/
+  techsweep_nfet_03v3_TT_Tp27.spice     ← non-uniform
+  uniform/
+    techsweep_nfet_03v3_TT_Tp27.spice   ← uniform
+
+output/
+  nfet_03v3_TT_Tp27.mat                 ← non-uniform
+  uniform/
+    nfet_03v3_TT_Tp27.mat               ← uniform
+```
+
+### VSB sweep
 
 By default each device uses a short built-in `vsb_vec` (typically `[0.0, -0.2, -0.4]` V).
 Use `--vsb-points N` to override with N evenly spaced points spanning the full 0 → −VDD range:
@@ -126,10 +185,38 @@ Batch 5/5: [FS] → 3 parallel jobs                           ← wait
 
 A STOP file (`touch STOP` in the working directory) halts execution between batches; any batch already in progress finishes cleanly. When `--device` is omitted, all devices run sequentially and the STOP file is also checked between devices.
 
+## Output Location
+
+By default `.mat` files go to `output/` and simulation files (`.spice`, `.txt`, `.log`)
+go to `sim/`, both relative to the working directory. Use `--output-dir` and `--sim-dir`
+to redirect to a different disk when the main drive is short on space:
+
+```bash
+# Send only .mat results to external storage
+python run_lut_char_all.py --device ihp:sg13_lv_nmos \
+    --output-dir /mnt/data/lut_output
+
+# Send both sim files and .mat results to external storage
+python run_lut_char_all.py --node ihp --corners-per-batch 1 \
+    --output-dir /mnt/data/lut_output \
+    --sim-dir /mnt/data/lut_sim
+```
+
+The `uniform/` subdirectory structure is preserved when `--uniform-grid` is used:
+
+```
+/mnt/data/lut_output/
+  sg13_lv_nmos_TT_Tp27.mat          ← non-uniform
+  uniform/
+    sg13_lv_nmos_TT_Tp27.mat        ← --uniform-grid
+```
+
 ## Progress Monitoring
 
 `monitor.sh` shows live per-corner, per-temperature progress for all GF180 devices.
-It auto-detects the VSB point count from the running netlists so percentages are always accurate:
+It auto-detects the VGS × VDS point count and the VSB count directly from the running
+netlists, so it works correctly for both the non-uniform and uniform grid modes without
+any manual configuration:
 
 ```
 22:58:04 — Active ngspice: 3 processes
@@ -154,10 +241,12 @@ watch -n 60 bash monitor.sh
 
 ### Per-PVT `.mat` files
 
-Each completed PVT job writes one `.mat` file to `output/`:
+Each completed PVT job writes one `.mat` file to `output/` (non-uniform grid) or
+`output/uniform/` (uniform grid):
 
 ```
-output/{device}_{corner}_T{p|m}{temp}.mat
+output/{device}_{corner}_T{p|m}{temp}.mat           ← non-uniform grid
+output/uniform/{device}_{corner}_T{p|m}{temp}.mat   ← --uniform-grid
 ```
 
 Inside each `.mat`, a single struct named after the device contains:

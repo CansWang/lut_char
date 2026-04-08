@@ -98,9 +98,18 @@ def build_vds_all(vds_max: float) -> np.ndarray:
     return np.concatenate([_VDS_FINE, coarse])
 
 
+def build_uniform_vgs(vgs_max: float) -> np.ndarray:
+    return np.round(np.arange(0.0, vgs_max + _UNIFORM_STEP * 0.1, _UNIFORM_STEP), 4)
+
+
+def build_uniform_vds(vds_max: float) -> np.ndarray:
+    return np.round(np.arange(0.0, vds_max + _UNIFORM_STEP * 0.1, _UNIFORM_STEP), 4)
+
+
 # ── VGS non-uniform grid ───────────────────────────────────────────────────────
 # Fine step is 10 mV for all devices
 _VGS_FINE_STEP = 0.010
+_UNIFORM_STEP  = 0.025   # 25 mV uniform grid step
 
 # Per-VGS_max: (fine_py_stop, fine_ng_stop,
 #               coarse_start, coarse_step, coarse_py_stop, coarse_ng_stop)
@@ -108,7 +117,7 @@ _VGS_FINE_STEP = 0.010
 # coarse grid: coarse_start … VGS_max
 _VGS_COARSE_CFG = {
     # 1.2V: fine 0–0.70V @10mV (71pts) + coarse 0.725–1.20V @25mV (20pts) = 91
-    1.2: (0.71,  "0.7001", 0.725, 0.025, 1.225,  "1.2001"),
+    1.2: (0.71,  "0.7001", 0.725, 0.025, 1.2001, "1.2001"),
     # 1.8V: fine 0–0.90V @10mV (91pts) + coarse 0.925–1.80V @25mV (35pts) = 126
     1.8: (0.91,  "0.9001", 0.925, 0.025, 1.825,  "1.8001"),
     # 3.3V: fine 0–1.50V @10mV (151pts) + coarse 1.55–3.30V @50mV (36pts) = 187
@@ -463,10 +472,31 @@ def _append_vds_block(L: list, out_txt: str, wrdata_arg: str,
     ]
 
 
+def _append_uniform_vds_block(L: list, out_txt: str, wrdata_arg: str,
+                               vds_max: float, indent: str = "    "):
+    """Append single uniform VDS foreach loop into list L at given indent level."""
+    i = indent
+    n_vds = len(build_uniform_vds(vds_max))
+    L += [
+        f"{i}* Uniform VDS (0–{vds_max}V @{_UNIFORM_STEP*1000:.0f}mV, {n_vds} pts)",
+        f"{i}foreach var3 $&vd_vec",
+        f"{i}  alter vd $var3",
+        f"{i}  foreach var4 $&vsb_vec",
+        f"{i}    alter vb $var4",
+        f"{i}    run",
+        f"{i}    wrdata {out_txt} {wrdata_arg}",
+        f"{i}    destroy all",
+        f"{i}    set appendwrite",
+        f"{i}    unset wr_vecnames",
+        f"{i}  end",
+        f"{i}end",
+    ]
+
+
 def generate_netlist(cfg: DevCfg, corner: str, temp: int,
                      l_vec, vsb_vec,
                      out_txt: str, netlist_path: str,
-                     vgs_override=None):
+                     vgs_override=None, uniform_grid: bool = False):
     """
     Write an ngspice netlist.
 
@@ -474,6 +504,8 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
                            full production runs.
                  : list  → explicit VGS values (compose values …), used for
                            test-run mode with a small number of points.
+    uniform_grid : True  → use a single uniform 25 mV grid for both VGS and VDS
+                           instead of the default non-uniform fine+coarse grids.
     """
     lib_corner   = cfg.lib_corner_map[corner]
     l_str        = _l_str(l_vec, cfg.has_explicit_u)
@@ -560,13 +592,34 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
         "",
         f"compose l_vec   values {l_str}",
         vsb_compose,
-        f"* Fine VDS (0–0.295V @5mV, 60 pts)",
-        f"compose vd_fine_vec   start=0   stop=0.2951       step=0.005",
-        f"* Coarse VDS (0.3–{cfg.vds_max}V @{vds_cs}V, {_n_vds_coarse(cfg.vds_max)} pts)",
-        f"compose vd_coarse_vec start=0.3 stop={vds_ng_stop} step={vds_cs}",
     ]
 
-    if vgs_override is None:
+    if uniform_grid:
+        vd_ng_stop = round(cfg.vds_max + _UNIFORM_STEP * 0.01, 6)
+        n_vds = len(build_uniform_vds(cfg.vds_max))
+        ctrl += [
+            f"* Uniform VDS (0–{cfg.vds_max}V @{_UNIFORM_STEP*1000:.0f}mV, {n_vds} pts)",
+            f"compose vd_vec start=0 stop={vd_ng_stop:.6f} step={_UNIFORM_STEP}",
+        ]
+    else:
+        ctrl += [
+            f"* Fine VDS (0–0.295V @5mV, 60 pts)",
+            f"compose vd_fine_vec   start=0   stop=0.2951       step=0.005",
+            f"* Coarse VDS (0.3–{cfg.vds_max}V @{vds_cs}V, {_n_vds_coarse(cfg.vds_max)} pts)",
+            f"compose vd_coarse_vec start=0.3 stop={vds_ng_stop} step={vds_cs}",
+        ]
+
+    if vgs_override is not None:
+        # Test-mode: explicit VGS list
+        ctrl.append(f"compose vg_vec values {_vec_str(vgs_override)}")
+    elif uniform_grid:
+        vg_ng_stop = round(cfg.vgs_max + _UNIFORM_STEP * 0.01, 6)
+        n_vgs = len(build_uniform_vgs(cfg.vgs_max))
+        ctrl += [
+            f"* Uniform VGS (0–{cfg.vgs_max}V @{_UNIFORM_STEP*1000:.0f}mV, {n_vgs} pts)",
+            f"compose vg_vec start=0 stop={vg_ng_stop:.6f} step={_UNIFORM_STEP}",
+        ]
+    else:
         # Full non-uniform VGS mode
         fine_py, fine_ng, cs_start, cs_step, cs_py, cs_ng = _VGS_COARSE_CFG[cfg.vgs_max]
         n_vf = _n_vgs_fine(cfg.vgs_max)
@@ -577,13 +630,22 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
             f"* Coarse VGS ({cs_start}–{cfg.vgs_max}V @{cs_step}V, {n_vc} pts)",
             f"compose vg_coarse_vec start={cs_start}  stop={cs_ng}   step={cs_step}",
         ]
-    else:
-        # Test-mode: explicit VGS list
-        ctrl.append(f"compose vg_vec values {_vec_str(vgs_override)}")
 
     ctrl += ["", "foreach var1 $&l_vec", "  alterparam lx=$var1", "  reset"]
 
-    if vgs_override is None:
+    if vgs_override is not None:
+        ctrl.append("  foreach var2 $&vg_vec")
+        ctrl.append("    alter vg $var2")
+        _append_vds_block(ctrl, out_txt, wrdata_arg, vds_cs, cfg.vds_max, indent="    ")
+        ctrl.append("  end")
+    elif uniform_grid:
+        n_vgs = len(build_uniform_vgs(cfg.vgs_max))
+        ctrl.append(f"  * === Uniform VGS sweep ({n_vgs} pts) ===")
+        ctrl.append("  foreach var2 $&vg_vec")
+        ctrl.append("    alter vg $var2")
+        _append_uniform_vds_block(ctrl, out_txt, wrdata_arg, cfg.vds_max, indent="    ")
+        ctrl.append("  end")
+    else:
         ctrl.append(f"  * === Fine VGS sweep ({n_vf} pts) ===")
         ctrl.append("  foreach var2 $&vg_fine_vec")
         ctrl.append("    alter vg $var2")
@@ -591,11 +653,6 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
         ctrl.append("  end")
         ctrl.append(f"  * === Coarse VGS sweep ({n_vc} pts) ===")
         ctrl.append("  foreach var2 $&vg_coarse_vec")
-        ctrl.append("    alter vg $var2")
-        _append_vds_block(ctrl, out_txt, wrdata_arg, vds_cs, cfg.vds_max, indent="    ")
-        ctrl.append("  end")
-    else:
-        ctrl.append("  foreach var2 $&vg_vec")
         ctrl.append("    alter vg $var2")
         _append_vds_block(ctrl, out_txt, wrdata_arg, vds_cs, cfg.vds_max, indent="    ")
         ctrl.append("  end")
@@ -630,14 +687,16 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
 
 # ── ngspice runner ─────────────────────────────────────────────────────────────
 
-def run_ngspice(netlist_path: str, log_path: str, label: str = "") -> bool:
+def run_ngspice(netlist_path: str, log_path: str, label: str = "",
+                env: dict = None, sim_dir: Path = None) -> bool:
     cmd = ["ngspice", "-b", netlist_path]
+    cwd = str(sim_dir) if sim_dir is not None else str(SIM_DIR)
     tag = f"[{label}] " if label else ""
     print(f"  {tag}[sim ] {' '.join(cmd)}")
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            cwd=str(SIM_DIR), timeout=7200
+            cwd=cwd, timeout=7200, env=env
         )
         with open(log_path, "w") as fh:
             fh.write(result.stdout)
@@ -658,7 +717,7 @@ def run_ngspice(netlist_path: str, log_path: str, label: str = "") -> bool:
 # ── Parser and .mat writer ─────────────────────────────────────────────────────
 
 def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
-                   l_vec, vgs_vec, vsb_vec, mat_path: str):
+                   l_vec, vgs_vec, vsb_vec, mat_path: str, vds_vec=None):
     print(f"  [read] {txt_path}")
     df_raw = pd.read_csv(txt_path, sep=r'\s+', engine='python')
 
@@ -686,7 +745,7 @@ def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
 
     print(f"  [read] Columns: {list(df.columns)}")
 
-    vds_all = build_vds_all(cfg.vds_max)
+    vds_all = vds_vec if vds_vec is not None else build_vds_all(cfg.vds_max)
     nL   = len(l_vec)
     nVGS = len(vgs_vec)
     nVDS = len(vds_all)
@@ -839,11 +898,11 @@ def validate_test_run(dic, dims, cfg: DevCfg):
 
 # ── IHP .spiceinit setup ───────────────────────────────────────────────────────
 
-def setup_spiceinit(cfg: DevCfg):
-    """Create SIM_DIR/.spiceinit symlink for IHP OSDI model loading."""
+def setup_spiceinit(cfg: DevCfg, sim_dir: Path = SIM_DIR):
+    """Create sim_dir/.spiceinit symlink for IHP OSDI model loading."""
     if cfg.spiceinit_src is None:
         return
-    link = SIM_DIR / ".spiceinit"
+    link = sim_dir / ".spiceinit"
     if link.exists() or link.is_symlink():
         return
     if not cfg.spiceinit_src.exists():
@@ -860,12 +919,14 @@ def _run_one_pvt(args):
     Run one (corner, temp) PVT job: generate netlist → ngspice → parse → save.
     Returns (corner, temp, mat_path) on success, None on failure.
     """
-    cfg, corner, temp, l_vec, vsb_vec, vgs_override, test_mode = args
+    cfg, corner, temp, l_vec, vsb_vec, vgs_override, test_mode, uniform_grid, base_sim_dir, base_out_dir = args
 
-    SIM_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    sim_dir = base_sim_dir / "uniform" if uniform_grid else base_sim_dir
+    out_dir = base_out_dir / "uniform" if uniform_grid else base_out_dir
+    sim_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     if cfg.pdk == "ihp":
-        setup_spiceinit(cfg)
+        setup_spiceinit(cfg, sim_dir)
 
     sign     = 'p' if temp >= 0 else 'm'
     tag      = f"{corner}_T{sign}{abs(temp)}"
@@ -882,19 +943,25 @@ def _run_one_pvt(args):
     else:
         l_suffix = ""
 
-    out_txt      = str(SIM_DIR / f"techsweep_{dev_safe}_{tag}{l_suffix}.txt")
-    netlist_path = str(SIM_DIR / f"techsweep_{dev_safe}_{tag}{l_suffix}.spice")
-    log_path     = str(SIM_DIR / f"techsweep_{dev_safe}_{tag}{l_suffix}.log")
-    mat_path     = str(OUT_DIR / f"{dev_safe}_{tag}{l_suffix}.mat")
+    out_txt      = str(sim_dir / f"techsweep_{dev_safe}_{tag}{l_suffix}.txt")
+    netlist_path = str(sim_dir / f"techsweep_{dev_safe}_{tag}{l_suffix}.spice")
+    log_path     = str(sim_dir / f"techsweep_{dev_safe}_{tag}{l_suffix}.log")
+    mat_path     = str(out_dir / f"{dev_safe}_{tag}{l_suffix}.mat")
 
     _p = Path(mat_path)
     if _p.exists() and _p.stat().st_size > 0:
         print(f"  [skip] {corner}/T{sign}{abs(temp)} — output exists: {mat_path}")
         return (corner, temp, mat_path)
 
-    # VGS vector for parse_and_save tensor reshape
-    parse_vgs = list(vgs_override) if vgs_override is not None else list(build_vgs_all(cfg.vgs_max))
-    vds_all   = build_vds_all(cfg.vds_max)
+    # VGS/VDS vectors for parse_and_save tensor reshape
+    if vgs_override is not None:
+        parse_vgs = list(vgs_override)
+    elif uniform_grid:
+        parse_vgs = list(build_uniform_vgs(cfg.vgs_max))
+    else:
+        parse_vgs = list(build_vgs_all(cfg.vgs_max))
+
+    vds_all = build_uniform_vds(cfg.vds_max) if uniform_grid else build_vds_all(cfg.vds_max)
 
     n_sim = len(l_vec) * len(parse_vgs) * len(vds_all) * len(vsb_vec)
     print(f"\n{'='*68}")
@@ -906,9 +973,15 @@ def _run_one_pvt(args):
         os.remove(out_txt)
 
     generate_netlist(cfg, corner, temp, l_vec, vsb_vec,
-                     out_txt, netlist_path, vgs_override=vgs_override)
+                     out_txt, netlist_path,
+                     vgs_override=vgs_override, uniform_grid=uniform_grid)
 
-    ok = run_ngspice(netlist_path, log_path, label=label)
+    sim_env = None
+    if cfg.pdk == "ihp":
+        sim_env = {**os.environ,
+                   "PDK_ROOT": str(_SPICEINIT_SRC.parents[3]),  # …/IHP-Open-PDK
+                   "PDK":      _SPICEINIT_SRC.parts[-4]}         # ihp-sg13g2
+    ok = run_ngspice(netlist_path, log_path, label=label, env=sim_env, sim_dir=sim_dir)
     if not ok:
         print(f"  [{label}] [SKIP] ngspice failed — see {log_path}")
         return None
@@ -918,7 +991,7 @@ def _run_one_pvt(args):
         return None
 
     dic, dims = parse_and_save(cfg, out_txt, corner, temp,
-                               l_vec, parse_vgs, vsb_vec, mat_path)
+                               l_vec, parse_vgs, vsb_vec, mat_path, vds_vec=vds_all)
     if test_mode:
         validate_test_run(dic, dims, cfg)
 
@@ -963,7 +1036,9 @@ def _smoke_grids(cfg: DevCfg):
 # ── Main orchestrator ──────────────────────────────────────────────────────────
 
 def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
-            max_workers=None, corners_per_batch=1, smoke_mode=False):
+            max_workers=None, corners_per_batch=1, smoke_mode=False,
+            uniform_grid: bool = False,
+            base_sim_dir: Path = None, base_out_dir: Path = None):
     """
     Orchestrate PVT sweep, running (corner, temp) jobs in parallel.
 
@@ -973,17 +1048,30 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
     test_mode        : run a micro-sweep (2L × 2VGS × 1VSB, TT/27°C) for validation.
     smoke_mode       : ultra-fast smoke test (1L × 1VGS × fullVDS × 1VSB, TT/27°C).
     corners_per_batch: number of corners to run in each sequential batch.
+    uniform_grid     : use a uniform 25 mV step for both VGS and VDS.
+    base_sim_dir     : root directory for .spice/.txt/.log files (default: SIM_DIR).
+    base_out_dir     : root directory for .mat output files (default: OUT_DIR).
     """
     if l_vec is None:
         l_vec = list(cfg.l_vec)
+    if base_sim_dir is None:
+        base_sim_dir = SIM_DIR
+    if base_out_dir is None:
+        base_out_dir = OUT_DIR
 
-    SIM_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    sim_dir = base_sim_dir / "uniform" if uniform_grid else base_sim_dir
+    out_dir = base_out_dir / "uniform" if uniform_grid else base_out_dir
+    sim_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     if cfg.pdk == "ihp":
-        setup_spiceinit(cfg)
+        setup_spiceinit(cfg, sim_dir)
 
-    vgs_vec = build_vgs_all(cfg.vgs_max)
-    vds_all = build_vds_all(cfg.vds_max)
+    if uniform_grid:
+        vgs_vec = build_uniform_vgs(cfg.vgs_max)
+        vds_all = build_uniform_vds(cfg.vds_max)
+    else:
+        vgs_vec = build_vgs_all(cfg.vgs_max)
+        vds_all = build_vds_all(cfg.vds_max)
 
     print(f"\n{'='*68}")
     print(f"  Device : {cfg.device}  PDK : {cfg.pdk}")
@@ -991,13 +1079,17 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
         l_info = (f"{l_vec[0]}–{l_vec[-1]}µm ({len(l_vec)} pts"
                   + (f", partial {len(l_vec)}/{len(cfg.l_vec)})" if len(l_vec) < len(cfg.l_vec) else ")"))
         print(f"  L      : {l_info}")
-        print(f"  VGS    : {_n_vgs_fine(cfg.vgs_max)} fine pts "
-              f"(0–{_vgs_fine_max(cfg.vgs_max):.3f}V @10mV) + "
-              f"{_n_vgs_coarse(cfg.vgs_max)} coarse pts = "
-              f"{len(vgs_vec)} total")
-        print(f"  VDS    : 60 fine pts (0–0.295V @5mV) + "
-              f"{_n_vds_coarse(cfg.vds_max)} coarse pts = "
-              f"{len(vds_all)} total")
+        if uniform_grid:
+            print(f"  VGS    : {len(vgs_vec)} pts (0–{cfg.vgs_max}V @25mV uniform)")
+            print(f"  VDS    : {len(vds_all)} pts (0–{cfg.vds_max}V @25mV uniform)")
+        else:
+            print(f"  VGS    : {_n_vgs_fine(cfg.vgs_max)} fine pts "
+                  f"(0–{_vgs_fine_max(cfg.vgs_max):.3f}V @10mV) + "
+                  f"{_n_vgs_coarse(cfg.vgs_max)} coarse pts = "
+                  f"{len(vgs_vec)} total")
+            print(f"  VDS    : 60 fine pts (0–0.295V @5mV) + "
+                  f"{_n_vds_coarse(cfg.vds_max)} coarse pts = "
+                  f"{len(vds_all)} total")
         n_pvt = len(corners) * len(temps)
         cap_disp = max_workers if max_workers is not None else N_WORKERS_DEFAULT
         print(f"  Jobs   : {n_pvt}  Workers/batch : {min(len(temps)*corners_per_batch, cap_disp)} / {os.cpu_count()} CPUs")
@@ -1007,16 +1099,16 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
     # Build batch list
     if test_mode:
         l_t, vgs_t, vsb_t = _test_grids(cfg)
-        batches = [("test", [(cfg, "TT", 27, l_t, vsb_t, vgs_t, True)])]
+        batches = [("test", [(cfg, "TT", 27, l_t, vsb_t, vgs_t, True, False, base_sim_dir, base_out_dir)])]
     elif smoke_mode:
         l_s, vgs_s, vsb_s = _smoke_grids(cfg)
-        batches = [("smoke", [(cfg, "TT", 27, l_s, vsb_s, vgs_s, False)])]
+        batches = [("smoke", [(cfg, "TT", 27, l_s, vsb_s, vgs_s, False, False, base_sim_dir, base_out_dir)])]
     else:
         corner_batches = [corners[i:i+corners_per_batch]
                           for i in range(0, len(corners), corners_per_batch)]
         batches = [
             (batch_corners, [
-                (cfg, corner, temp, l_vec, cfg.vsb_vec, None, False)
+                (cfg, corner, temp, l_vec, cfg.vsb_vec, None, False, uniform_grid, base_sim_dir, base_out_dir)
                 for corner in batch_corners
                 for temp in temps
             ])
@@ -1051,7 +1143,7 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
                             c, t, mat_path = result
                             print(f"\n  [done] {c}/T{sign}{abs(t)} → {mat_path}")
                         else:
-                            print(f"\n  [FAIL] {corner}/T{sign}{abs(temp)} — see log in {SIM_DIR}")
+                            print(f"\n  [FAIL] {corner}/T{sign}{abs(temp)} — see log in {sim_dir}")
                     except Exception as exc:
                         print(f"\n  [EXC ] {corner}/T{sign}{abs(temp)} raised: {exc}")
 
@@ -1070,12 +1162,16 @@ def main():
               python run_lut_char_all.py --device gf180:nfet_03v3 --corners TT SS
               python run_lut_char_all.py --device gf180:nfet_05v0 --corners TT FF
               python run_lut_char_all.py --device gf180:nfet_03v3 --l-range 0:6  # first 6 L values
+              python run_lut_char_all.py --node ihp --corners-per-batch 1
         """)
     )
     ap.add_argument("--list", action="store_true",
                     help="Print all available device keys and exit")
     ap.add_argument("--device", metavar="PDK:DEVICE",
                     help="Device key, e.g. sky130:nfet_01v8")
+    ap.add_argument("--node", metavar="NODE",
+                    choices=["sky130", "ihp", "gf180"],
+                    help="Run all devices for a specific PDK node (sky130, ihp, gf180)")
     ap.add_argument("--test-run", action="store_true",
                     help="Micro-sweep validation (2 L, 2 VGS, 1 VSB, TT/27°C)")
     ap.add_argument("--smoke", action="store_true",
@@ -1102,6 +1198,16 @@ def main():
                     help="Override vsb_vec with N evenly spaced points from 0 to -VDD "
                          "(e.g. 5 gives [0, -VDD/4, ..., -VDD]). "
                          "Default: use each device's built-in vsb_vec.")
+    ap.add_argument("--uniform-grid", action="store_true",
+                    help="Use a uniform 25 mV step for both VGS and VDS "
+                         "instead of the default non-uniform fine+coarse grid.")
+    ap.add_argument("--output-dir", metavar="DIR", default=None,
+                    help=f"Directory for .mat output files (default: {OUT_DIR}). "
+                         "A 'uniform/' subdirectory is created automatically when "
+                         "--uniform-grid is used.")
+    ap.add_argument("--sim-dir", metavar="DIR", default=None,
+                    help=f"Directory for .spice/.txt/.log simulation files "
+                         f"(default: {SIM_DIR}).")
     args = ap.parse_args()
 
     if STOP_FILE.exists():
@@ -1120,10 +1226,16 @@ def main():
                   f"corners={list(c.lib_corner_map.keys())}")
         return
 
-    if args.device:
+    if args.device and args.node:
+        ap.error("--device and --node are mutually exclusive.")
+    elif args.device:
         if args.device not in DEVICES:
             ap.error(f"Unknown device '{args.device}'. Use --list to see available keys.")
         device_keys = [args.device]
+    elif args.node:
+        device_keys = [k for k, c in DEVICES.items() if c.pdk == args.node]
+        if not device_keys:
+            ap.error(f"No devices found for node '{args.node}'.")
     else:
         device_keys = list(DEVICES.keys())
 
@@ -1171,18 +1283,26 @@ def main():
                          f"(has {len(cfg.l_vec)} L values)")
 
         if not args.test_run and not args.smoke:
-            vgs_all = build_vgs_all(cfg.vgs_max)
-            vds_all = build_vds_all(cfg.vds_max)
+            if args.uniform_grid:
+                vgs_all = build_uniform_vgs(cfg.vgs_max)
+                vds_all = build_uniform_vds(cfg.vds_max)
+            else:
+                vgs_all = build_vgs_all(cfg.vgs_max)
+                vds_all = build_vds_all(cfg.vds_max)
             n_pvt   = len(corners) * len(args.temps)
             n_sim   = len(l_vec) * len(vgs_all) * len(vds_all) * len(cfg.vsb_vec)
             l_info  = (f"{l_vec[0]}–{l_vec[-1]}µm ({len(l_vec)} pts"
                        + (f", partial {len(l_vec)}/{len(cfg.l_vec)})" if args.l_range else ")"))
             print(f"\nPDK: {cfg.pdk}  Device: {cfg.device}")
             print(f"L:   {l_info}")
-            print(f"VGS: {_n_vgs_fine(cfg.vgs_max)} fine (0–{_vgs_fine_max(cfg.vgs_max):.2f}V @10mV) + "
-                  f"{_n_vgs_coarse(cfg.vgs_max)} coarse = {len(vgs_all)} pts")
-            print(f"VDS: 60 fine (0–0.295V @5mV) + "
-                  f"{_n_vds_coarse(cfg.vds_max)} coarse = {len(vds_all)} pts")
+            if args.uniform_grid:
+                print(f"VGS: {len(vgs_all)} pts (0–{cfg.vgs_max}V @25mV uniform)")
+                print(f"VDS: {len(vds_all)} pts (0–{cfg.vds_max}V @25mV uniform)")
+            else:
+                print(f"VGS: {_n_vgs_fine(cfg.vgs_max)} fine (0–{_vgs_fine_max(cfg.vgs_max):.2f}V @10mV) + "
+                      f"{_n_vgs_coarse(cfg.vgs_max)} coarse = {len(vgs_all)} pts")
+                print(f"VDS: 60 fine (0–0.295V @5mV) + "
+                      f"{_n_vds_coarse(cfg.vds_max)} coarse = {len(vds_all)} pts")
             print(f"VSB: {len(cfg.vsb_vec)} pts  {cfg.vsb_vec}")
             print(f"Corners: {corners}  Temps: {args.temps}  PVT jobs: {n_pvt}")
             cap = args.workers if args.workers is not None else N_WORKERS_DEFAULT
@@ -1193,7 +1313,10 @@ def main():
                 test_mode=args.test_run,
                 smoke_mode=args.smoke,
                 max_workers=args.workers,
-                corners_per_batch=args.corners_per_batch)
+                corners_per_batch=args.corners_per_batch,
+                uniform_grid=args.uniform_grid,
+                base_sim_dir=Path(args.sim_dir) if args.sim_dir else None,
+                base_out_dir=Path(args.output_dir) if args.output_dir else None)
 
 
 if __name__ == "__main__":
