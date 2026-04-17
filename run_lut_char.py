@@ -301,7 +301,7 @@ def parse_and_save(txt_path: str, corner: str, temp: int,
     dic = {
         "INFO":   f"SkyWater 130nm CMOS BSIM4 — {DEVICE}",
         "CORNER": corner.upper(),
-        "TEMP":   float(temp + 273.15),
+        "TEMP":   float(temp),
         "VGS":    np.array(vgs_vec),
         "VDS":    VDS_ALL,
         "VSB":    np.array([abs(v) for v in vsb_vec]),

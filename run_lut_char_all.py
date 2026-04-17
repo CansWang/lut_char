@@ -788,7 +788,7 @@ def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
     dic = {
         "INFO":   f"{cfg.pdk.upper()} PDK — {cfg.device}",
         "CORNER": corner.upper(),
-        "TEMP":   float(temp + 273.15),
+        "TEMP":   float(temp),
         "VGS":    np.array(vgs_vec),
         "VDS":    vds_all,
         "VSB":    vsb_mat,

@@ -335,7 +335,7 @@ def parse_and_save(txt_path: str, corner: str, temp: int,
     dic = {
         "INFO":   f"IHP SG13G2 130nm BiCMOS PSP — {DEVICE}",
         "CORNER": corner.upper(),
-        "TEMP":   float(temp + 273.15),
+        "TEMP":   float(temp),
         "VGS":    np.array(vgs_vec),    # |VGS| magnitudes
         "VDS":    VDS_ALL,              # |VDS| magnitudes
         "VSB":    vsb_mat,
