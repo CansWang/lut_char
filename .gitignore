@@ -1,9 +1,20 @@
 # Simulation intermediate files (large, machine-generated — do not commit)
 /sim/
 /output/
+*.mat
+*.nc
+*.log
+techsweep_*.spice
+techsweep_*.txt
+cap_probe_*.spice
+cap_probe_*.txt
+
+# Benchmark plots
+*.png
 
 # Python cache
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 

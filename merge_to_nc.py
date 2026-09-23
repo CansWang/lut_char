@@ -24,19 +24,33 @@ import numpy as np
 import scipy.io
 import xarray as xr
 
+from capacitance import CAP_PROFILE_LEGACY, CAP_PROFILE_MATRIX9, LEGACY_CAP_KEYS, MATRIX9_KEYS
+
 # Canonical corner order
 CORNER_ORDER = ["TT", "FF", "SS", "SF", "FS"]
 
-DATA_KEYS = [
-    "ID", "VT", "GM", "GMB", "GDS",
-    "CGG", "CGB", "CGD", "CGS", "CDD", "CSS",
-    "STH", "SFL", "VDSAT",
-]
+CORE_DATA_KEYS = ("ID", "VT", "GM", "GMB", "GDS")
+OPTIONAL_DATA_KEYS = ("STH", "SFL", "VDSAT")
+DATA_KEYS = list(CORE_DATA_KEYS + LEGACY_CAP_KEYS + OPTIONAL_DATA_KEYS)
+PROFILE_METADATA_KEYS = (
+    "CAPACITANCE_PROFILE", "CAPACITANCE_SCHEMA_VERSION",
+    "CAPACITANCE_CONVENTION", "CAPACITANCE_TERMINALS",
+    "CAPACITANCE_COMPONENTS", "MODEL_FAMILY", "BULK_TERMINAL_ALIAS",
+)
 
-# Matches: {device}_{corner}_T{p|m}{abs_temp}.mat
-# Partial-L files (e.g. _L280to600nm.mat) are excluded by anchoring at .mat
+# Matches: {device}_{corner}_T{p|m}{abs_temp}{grid_suffix}.mat
+# grid_suffix is the file-name suffix added by run_lut_char_all.py to
+# differentiate sweeps that share the same (device, corner, temp):
+#     _uvgs{X}mV_uvds{Y}mV_vsb{N}   (uniform-grid runs)
+#     _vsb{N}                       (non-uniform runs)
+#     (empty)                       (legacy files predating the suffix)
+# Partial-L files (e.g. _L280to600nm.mat) are excluded by the separate
+# _L\d+to\d+nm check in collect_files.
 _FILE_RE = re.compile(
-    r'^(?P<device>.+?)_(?P<corner>TT|FF|SS|SF|FS)_T(?P<tsign>[pm])(?P<tval>\d+)\.mat$'
+    r'^(?P<device>.+?)_(?P<corner>TT|FF|SS|SF|FS)_T(?P<tsign>[pm])(?P<tval>\d+)'
+    r'(?P<suffix>(?:_uvgs[\d.]+mV_uvds[\d.]+mV)?(?:_vsb\d+)?)'
+    r'(?P<profile>_cm9)?'
+    r'\.mat$'
 )
 
 
@@ -56,6 +70,8 @@ def collect_files(input_dir: Path, device_filter=None):
         if not m:
             continue
         device = m.group("device")
+        suffix = m.group("suffix") or ""
+        profile_suffix = m.group("profile") or ""
         corner = m.group("corner")
         tsign  = m.group("tsign")
         tval   = int(m.group("tval"))
@@ -64,7 +80,10 @@ def collect_files(input_dir: Path, device_filter=None):
         if device_filter and device_filter not in device:
             continue
 
-        by_device.setdefault(device, {})[corner, temp] = path
+        # Group separately per grid-suffix so different sweeps don't collide
+        # in the output .nc filename.
+        device_key = f"{device}{suffix}{profile_suffix}"
+        by_device.setdefault(device_key, {})[corner, temp] = path
 
     return by_device
 
@@ -76,6 +95,40 @@ def load_mat(path: Path) -> dict:
     if len(keys) != 1:
         raise ValueError(f"{path}: expected 1 top-level key, found {keys}")
     return raw[keys[0]]
+
+
+def _scalar(value):
+    arr = np.asarray(value)
+    return arr.flat[0].item() if arr.size else None
+
+
+def _profile(data):
+    return str(_scalar(data.get("CAPACITANCE_PROFILE", CAP_PROFILE_LEGACY)))
+
+
+def _data_keys(data):
+    profile = _profile(data)
+    if profile == CAP_PROFILE_MATRIX9:
+        caps = MATRIX9_KEYS
+    elif profile == CAP_PROFILE_LEGACY:
+        caps = LEGACY_CAP_KEYS
+    else:
+        raise ValueError(f"unsupported capacitance profile '{profile}'")
+    required = CORE_DATA_KEYS + caps
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError(f"{profile} data is missing required keys: {', '.join(missing)}")
+    return required + tuple(key for key in OPTIONAL_DATA_KEYS if key in data)
+
+
+def _as_tensor(data, key, expected_shape):
+    arr = np.asarray(data[key], dtype=float)
+    expected_size = int(np.prod(expected_shape))
+    if arr.size != expected_size:
+        raise ValueError(
+            f"{key} has {arr.size} values; expected {expected_size} for shape {expected_shape}"
+        )
+    return arr.reshape(expected_shape)
 
 
 def build_dataset(files_by_ct: dict, device_name: str) -> xr.Dataset:
@@ -98,6 +151,8 @@ def build_dataset(files_by_ct: dict, device_name: str) -> xr.Dataset:
     # --- 2. Load one file to determine coordinate arrays ---
     first_path = next(iter(files_by_ct.values()))
     d0 = load_mat(first_path)
+    profile = _profile(d0)
+    data_keys = _data_keys(d0)
 
     L_arr   = np.atleast_1d(np.array(d0["L"],   dtype=float))
     VGS_arr = np.atleast_1d(np.array(d0["VGS"], dtype=float))
@@ -107,9 +162,9 @@ def build_dataset(files_by_ct: dict, device_name: str) -> xr.Dataset:
 
     nL, nVGS, nVDS, nVSB = len(L_arr), len(VGS_arr), len(VDS_arr), len(VSB_arr)
 
-    # --- 3. Pre-allocate NaN arrays for all DATA_KEYS ---
+    # --- 3. Pre-allocate NaN arrays for this capacitance profile ---
     shape = (nC, nT, nL, nVGS, nVDS, nVSB)
-    arrays = {k: np.full(shape, np.nan, dtype=float) for k in DATA_KEYS}
+    arrays = {k: np.full(shape, np.nan, dtype=float) for k in data_keys}
 
     # Scalar metadata (W, NFING) from first file
     W     = float(np.array(d0.get("W",     np.nan)).flat[0])
@@ -128,20 +183,20 @@ def build_dataset(files_by_ct: dict, device_name: str) -> xr.Dataset:
             print(f"  [warn] could not load {path}: {exc}", file=sys.stderr)
             continue
 
-        for k in DATA_KEYS:
-            if k not in d:
-                continue
-            arr = np.array(d[k], dtype=float)
-            # Shape from .mat is (nL, nVGS, nVDS, nVSB) or (nVGS, nVDS, nVSB) for single L
-            if arr.ndim == 3:
-                arr = arr[np.newaxis]   # → (1, nVGS, nVDS, nVSB)
-            if arr.shape != (nL, nVGS, nVDS, nVSB):
-                print(
-                    f"  [warn] {path.name} key={k} shape {arr.shape} "
-                    f"!= expected {(nL, nVGS, nVDS, nVSB)}, skipping",
-                    file=sys.stderr,
-                )
-                continue
+        if _profile(d) != profile or _data_keys(d) != data_keys:
+            raise ValueError(f"{path}: profile/tensor keys do not match {first_path}")
+        for key in PROFILE_METADATA_KEYS:
+            if _scalar(d.get(key)) != _scalar(d0.get(key)):
+                raise ValueError(f"{path}: metadata '{key}' does not match {first_path}")
+        for axis, ref_axis in (("L", L_arr), ("VGS", VGS_arr),
+                               ("VDS", VDS_arr), ("VSB", VSB_arr)):
+            values = np.unique(np.asarray(d[axis], dtype=float).ravel()) if axis == "VSB" \
+                else np.atleast_1d(np.asarray(d[axis], dtype=float))
+            if not np.allclose(values, ref_axis):
+                raise ValueError(f"{path}: {axis} grid does not match {first_path}")
+
+        for k in data_keys:
+            arr = _as_tensor(d, k, (nL, nVGS, nVDS, nVSB))
             arrays[k][ci, ti] = arr
 
     # --- 5. Build xr.Dataset, drop all-NaN variables ---
@@ -156,7 +211,7 @@ def build_dataset(files_by_ct: dict, device_name: str) -> xr.Dataset:
     }
 
     data_vars = {}
-    for k in DATA_KEYS:
+    for k in data_keys:
         arr = arrays[k]
         if not np.all(np.isnan(arr)):
             data_vars[k] = xr.Variable(dims, arr)
@@ -168,6 +223,10 @@ def build_dataset(files_by_ct: dict, device_name: str) -> xr.Dataset:
         "NFING":   NFING,
         "created": datetime.now(timezone.utc).isoformat(),
     }
+    for key in PROFILE_METADATA_KEYS:
+        value = _scalar(d0.get(key))
+        if value is not None:
+            ds.attrs[key] = value
     return ds
 
 
@@ -214,7 +273,11 @@ def main():
             continue
 
         out_path = output_dir / f"{device_name}.nc"
-        ds.to_netcdf(str(out_path))
+        encoding = {
+            name: {"zlib": True, "complevel": 4, "shuffle": True}
+            for name in ds.data_vars
+        }
+        ds.to_netcdf(str(out_path), encoding=encoding)
         print(f"  Written : {out_path}")
         print(f"  Shape   : corner={ds.sizes['corner']}  temp={ds.sizes['temp']}  "
               f"L={ds.sizes['L']}  VGS={ds.sizes['VGS']}  "

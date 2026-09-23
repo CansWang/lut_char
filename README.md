@@ -1,8 +1,10 @@
 # LUT Characterization Pipeline
 
-Generates gm/ID design lookup tables (LUTs) for open-source PDKs by sweeping
-SPICE operating points over a configurable (VGS, VDS) grid and saving results as
-`.mat` files compatible with the [gm/ID design methodology].
+Generates transistor operating-point lookup tables (LUTs) for open-source PDKs
+by sweeping SPICE operating points over a configurable (VGS, VDS) grid and
+saving results as `.mat` and NetCDF files. The LUTs support general design-space
+exploration and remain compatible with gm/ID-based analysis after a solution or
+design space has been selected; the pipeline does not enforce a gm/ID method.
 
 Two grid modes are supported:
 - **Non-uniform** (default): fine 10 mV / 5 mV steps near 0 V to capture weak/moderate
@@ -83,6 +85,94 @@ python run_lut_char_all.py --device gf180:nfet_03v3 --output-dir /mnt/data/lut_o
 # Merge all per-(corner, temp) .mat files into a single labelled NetCDF4 file
 python merge_to_nc.py --input-dir output/ --output-dir output/
 ```
+
+## Signed Capacitance Matrix (opt-in)
+
+The authoritative implementation contract and verification record are in
+[`CAPACITANCE_MATRIX_SSOT.md`](CAPACITANCE_MATRIX_SSOT.md).
+
+Use `--cap-matrix` when a downstream small-signal or symbolic-analysis tool needs
+the full set of independent terminal transcapacitances:
+
+```bash
+# BSIM4 or PSP built-in device
+python run_lut_char_all.py --device sky130:nfet_01v8 --cap-matrix --test-run
+
+# External model/device definition, including BSIM-CMG
+python run_lut_char_all.py --device-config devices.json \
+    --device mypdk:nmos --cap-matrix --test-run
+```
+
+This profile stores the signed total-capacitance Matrix9 fields:
+
+```
+CGG CGD CGS
+CDG CDD CDS
+CSG CSD CSS
+```
+
+The convention is `Cij = dQi/dVj`, terminal order is `G,D,S,B`, and each value
+includes the model's intrinsic and extrinsic overlap/junction capacitances. The
+bulk row and column are reconstructed by charge conservation and common-mode
+invariance:
+
+```
+CiB = -(CiG + CiD + CiS)
+CBj = -(CGj + CDj + CSj)
+CBB = sum(Cij), i,j in {G,D,S}
+```
+
+Matrix9 outputs use a `_cm9` filename suffix and therefore cannot overwrite or
+be merged with legacy six-capacitance outputs. Before a sweep starts, a one-point
+ngspice capability probe verifies that every required native field is available.
+
+Model normalization is handled as follows:
+
+- BSIM4: signed intrinsic 3x3 matrix plus `cgdo`, `cgso`, `cgbo`, `capbd`, and `capbs`.
+- PSP 103: normalized PSP off-diagonal signs plus `cgdol`, `cgsol`, `lp_cgbov`, `cjd`, and `cjs`.
+- BSIM-CMG: direct total `CGG...CSS` outputs, with the model's off-diagonal
+  `-dQi/dVj` reporting normalized to the signed schema. The model must be
+  compiled with its `INFO` operating-point outputs enabled.
+
+### External device JSON
+
+`--device-config` is repeatable. Each JSON file contains a `devices` list; keys
+must not duplicate built-in or previously loaded devices. Paths and environment
+values expand `~` and environment variables.
+
+```json
+{
+  "devices": [
+    {
+      "key": "mypdk:nmos",
+      "device": "nmos_model",
+      "pdk": "mypdk",
+      "fet_type": "nfet",
+      "model_family": "bsim-cmg",
+      "model_lib": "$PDK_ROOT/models/mos.lib",
+      "lib_corner_map": {"TT": "tt", "FF": "ff", "SS": "ss"},
+      "model_setup_lines": [".lib {MODEL_LIB} {LIB_CORNER}"],
+      "instance_template": "XM1 {D} {G} {S} {B} {DEVICE} L={LX} W={W_UM}u NFIN={NFING}",
+      "save_pfx": "@m.xm1.m0",
+      "l_vec": [0.02, 0.03, 0.04],
+      "vgs_max": 0.8,
+      "vds_max": 0.8,
+      "vsb_vec": [0.0, -0.2, -0.4],
+      "has_explicit_u": true,
+      "analysis": "op",
+      "id_col": "ids",
+      "gmb_col": "gmbs",
+      "output_aliases": {"id": "ids", "gmb": "gmbs"},
+      "bulk_terminal_alias": "E",
+      "simulation_env": {"PDK_ROOT": "$HOME/pdks/mypdk"}
+    }
+  ]
+}
+```
+
+`bulk_terminal_alias: "E"` maps BSIM-CMG's electrostatic bulk terminal name to
+canonical terminal `B` in the saved schema. `output_aliases` maps canonical
+lowercase operating-point names to simulator-specific names when they differ.
 
 ## Voltage Grid
 
@@ -247,6 +337,7 @@ Each completed PVT job writes one `.mat` file to `output/` (non-uniform grid) or
 ```
 output/{device}_{corner}_T{p|m}{temp}.mat           ← non-uniform grid
 output/uniform/{device}_{corner}_T{p|m}{temp}.mat   ← --uniform-grid
+output/{device}_{corner}_T{p|m}{temp}_vsb{N}_cm9.mat ← --cap-matrix
 ```
 
 Inside each `.mat`, a single struct named after the device contains:
@@ -264,6 +355,12 @@ Inside each `.mat`, a single struct named after the device contains:
 | `SFL` | (nL, nVGS, nVDS, nVSB) | Flicker noise PSD |
 | `VDSAT` | (nL, nVGS, nVDS, nVSB) | Saturation voltage (BSIM4 devices only) |
 | `VGS/VDS/VSB/L` | vectors | Axis coordinates |
+
+With `--cap-matrix`, the six legacy capacitance fields are replaced by
+`CGG, CGD, CGS, CDG, CDD, CDS, CSG, CSD, CSS`. The MAT struct and resulting
+NetCDF file also carry `CAPACITANCE_*`, `MODEL_FAMILY`, and
+`BULK_TERMINAL_ALIAS` metadata. Noise fields are retained when the selected
+model exposes them and omitted otherwise.
 
 ### Per-device `.nc` NetCDF4 file (xarray)
 
@@ -300,6 +397,50 @@ gm_ff_hot = ds["GM"].sel(corner="FF", temp=125) # shape (12, 187, 91, 8)
 
 Missing (corner, temp) combinations are filled with `NaN`; variables absent from
 all files (e.g. `VDSAT` on IHP devices) are dropped automatically.
+
+## Interpolation Benchmark
+
+`benchmark_interp.py` compares interpolation **speed vs accuracy** across the
+uniform-grid `.mat` files for a chosen device/corner/temp. It sweeps four axes:
+
+- **Grid spacing** — every uniform grid available for the device (e.g. 10 / 25 / 50 mV).
+- **Method** — `linear` vs `pchip` (`scipy.interpolate.RegularGridInterpolator`, scipy ≥ 1.13).
+- **Domain** — linear vs `asinh(x/scale)` log-domain (sign-preserving, round-trips exactly).
+- **Variable** — all 14 LUT vars by default (`ID, VT, GM, GMB, GDS, CGG, CGB, CGD, CGS, CDD, CSS, STH, SFL, VDSAT`).
+
+Accuracy of each coarse grid is measured against the **finest available grid** evaluated
+with the *same* (method, domain), so the metric isolates the grid-spacing contribution.
+
+```bash
+# Default: sg13_lv_pmos, TT, 27°C, L-idx 0, N=10k queries, 3 repeats (~3 min)
+python benchmark_interp.py
+
+# Different device / corner / temperature / L
+python benchmark_interp.py --device sg13_lv_nmos --corner SS --temp -40 --l-index 2
+
+# Tighter timing medians (~30 min)
+python benchmark_interp.py --n-query 50000 --repeats 5
+
+# Skip the plot or skip accuracy comparison
+python benchmark_interp.py --no-plot
+python benchmark_interp.py --no-accuracy
+
+# Subset of variables
+python benchmark_interp.py --vars ID GM GDS
+```
+
+**Methodology** — one shared random query set (fixed seed) of N points in the
+axis interior `[a+1%·span, b-1%·span]`. For each combo: one warmup call, then K
+timed repeats of a single vectorized batched call; `qps = N / median(times)`.
+Build time and query throughput are reported separately. Accuracy metric is
+`|y_test − y_ref| / (|y_ref| + median(|y_ref|))`, reported as RMS and p99.
+
+**Outputs**
+- Markdown-style table to stdout: `var | grid(mV) | method | domain | build_ms | qps | rms_err | p99_err`.
+- `benchmark_interp.png` — speed-vs-error scatter, one subplot per variable
+  (color = method, marker = domain, hollow = reference grid).
+
+`VDSAT` is automatically skipped on IHP devices (not produced by the model).
 
 ## Distributed Computation
 

@@ -53,6 +53,7 @@ Usage
 
 import argparse
 import concurrent.futures
+import json
 import os
 import subprocess
 import textwrap
@@ -63,6 +64,15 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from scipy.io import savemat
+
+from capacitance import (
+    CAP_PROFILE_MATRIX9,
+    capacitance_metadata,
+    matrix9_to_fields,
+    native_to_matrix9,
+    normalize_model_family,
+    required_native_fields,
+)
 
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -92,24 +102,46 @@ _VDS_COARSE_CFG = {
 }
 
 
+def _vds_coarse_cfg(vds_max: float):
+    if vds_max in _VDS_COARSE_CFG:
+        return _VDS_COARSE_CFG[vds_max]
+    if vds_max < 0.3:
+        raise ValueError("vds_max must be at least 0.3 V for the non-uniform grid")
+    step = 0.05 if vds_max <= 1.8 else 0.1
+    return step, vds_max + step * 0.1, f"{vds_max + step * 0.01:.6f}"
+
+
 def build_vds_all(vds_max: float) -> np.ndarray:
-    step, py_stop, _ = _VDS_COARSE_CFG[vds_max]
+    step, py_stop, _ = _vds_coarse_cfg(vds_max)
     coarse = np.round(np.arange(0.3, py_stop, step), 4)
     return np.concatenate([_VDS_FINE, coarse])
 
 
-def build_uniform_vgs(vgs_max: float) -> np.ndarray:
-    return np.round(np.arange(0.0, vgs_max + _UNIFORM_STEP * 0.1, _UNIFORM_STEP), 4)
+def build_uniform_vgs(vgs_max: float, step: float = 0.025) -> np.ndarray:
+    return np.round(np.arange(0.0, vgs_max + step * 0.1, step), 4)
 
 
-def build_uniform_vds(vds_max: float) -> np.ndarray:
-    return np.round(np.arange(0.0, vds_max + _UNIFORM_STEP * 0.1, _UNIFORM_STEP), 4)
+def build_uniform_vds(vds_max: float, step: float = 0.025) -> np.ndarray:
+    return np.round(np.arange(0.0, vds_max + step * 0.1, step), 4)
 
 
 # ── VGS non-uniform grid ───────────────────────────────────────────────────────
 # Fine step is 10 mV for all devices
 _VGS_FINE_STEP = 0.010
-_UNIFORM_STEP  = 0.025   # 25 mV uniform grid step
+_UNIFORM_STEP_DEFAULT = 0.025   # default uniform step; overridden by --vgs-step / --vds-step
+
+
+def _grid_suffix(uniform_grid: bool, vgs_step: float, vds_step: float, n_vsb: int) -> str:
+    """File-name suffix encoding sweep parameters not already in the corner/temp tag.
+
+    Uniform mode → '_uvgs{X}mV_uvds{Y}mV_vsb{N}'
+    Non-uniform  → '_vsb{N}'
+    """
+    if uniform_grid:
+        return (f"_uvgs{vgs_step*1000:g}mV"
+                f"_uvds{vds_step*1000:g}mV"
+                f"_vsb{n_vsb}")
+    return f"_vsb{n_vsb}"
 
 # Per-VGS_max: (fine_py_stop, fine_ng_stop,
 #               coarse_start, coarse_step, coarse_py_stop, coarse_ng_stop)
@@ -127,26 +159,45 @@ _VGS_COARSE_CFG = {
 }
 
 
+def _vgs_coarse_cfg(vgs_max: float):
+    if vgs_max in _VGS_COARSE_CFG:
+        return _VGS_COARSE_CFG[vgs_max]
+    if vgs_max <= 0:
+        raise ValueError("vgs_max must be positive")
+    coarse_step = 0.025 if vgs_max <= 1.8 else (0.05 if vgs_max <= 3.3 else 0.1)
+    fine_max = round(round((0.5 * vgs_max) / _VGS_FINE_STEP) * _VGS_FINE_STEP, 4)
+    fine_py_stop = fine_max + _VGS_FINE_STEP
+    coarse_start = fine_max + coarse_step
+    return (
+        fine_py_stop,
+        f"{fine_max + _VGS_FINE_STEP * 0.01:.6f}",
+        coarse_start,
+        coarse_step,
+        vgs_max + coarse_step * 0.1,
+        f"{vgs_max + coarse_step * 0.01:.6f}",
+    )
+
+
 def build_vgs_all(vgs_max: float) -> np.ndarray:
-    fine_py, _, cs_start, cs_step, cs_py, _ = _VGS_COARSE_CFG[vgs_max]
+    fine_py, _, cs_start, cs_step, cs_py, _ = _vgs_coarse_cfg(vgs_max)
     fine   = np.round(np.arange(0.0, fine_py,  _VGS_FINE_STEP), 4)
     coarse = np.round(np.arange(cs_start, cs_py, cs_step), 4)
     return np.concatenate([fine, coarse])
 
 
 def _n_vgs_fine(vgs_max: float) -> int:
-    fine_py, *_ = _VGS_COARSE_CFG[vgs_max]
+    fine_py, *_ = _vgs_coarse_cfg(vgs_max)
     return len(np.round(np.arange(0.0, fine_py, _VGS_FINE_STEP), 4))
 
 
 def _n_vgs_coarse(vgs_max: float) -> int:
-    _, _, cs_start, cs_step, cs_py, _ = _VGS_COARSE_CFG[vgs_max]
+    _, _, cs_start, cs_step, cs_py, _ = _vgs_coarse_cfg(vgs_max)
     return len(np.round(np.arange(cs_start, cs_py, cs_step), 4))
 
 
 def _vgs_fine_max(vgs_max: float) -> float:
     """Last fine VGS point (= fine_py_stop - step)."""
-    fine_py, *_ = _VGS_COARSE_CFG[vgs_max]
+    fine_py, *_ = _vgs_coarse_cfg(vgs_max)
     return round(fine_py - _VGS_FINE_STEP, 4)
 
 
@@ -190,6 +241,13 @@ class DevCfg:
     caps_model: str = "bsim4"   # "bsim4" | "psp"
     gmb_col: str = "gmbs"        # "gmbs" bsim4, "gmb" psp
     id_col: str = "id"           # "id" bsim4, "ids" psp
+
+    # Optional adapter hooks used by JSON-defined devices (including BSIM-CMG).
+    instance_template: Optional[str] = None
+    model_setup_lines: list = field(default_factory=list)
+    simulation_env: dict = field(default_factory=dict)
+    output_aliases: dict = field(default_factory=dict)
+    bulk_terminal_alias: str = "B"
 
 
 # ── Model library paths ────────────────────────────────────────────────────────
@@ -399,6 +457,148 @@ DEVICES = {
 
 # ── Small helpers ──────────────────────────────────────────────────────────────
 
+def _expanded_path(value):
+    if value is None:
+        return None
+    return os.path.expandvars(os.path.expanduser(str(value)))
+
+
+def load_device_configs(paths, registry=None):
+    """Load JSON-defined devices and return a registry including built-ins."""
+    result = dict(DEVICES if registry is None else registry)
+    allowed = set(DevCfg.__dataclass_fields__)
+    required = {
+        "key", "device", "pdk", "fet_type", "model_lib", "lib_corner_map",
+        "l_vec", "vgs_max", "vds_max", "save_pfx", "instance_template",
+    }
+
+    for path_value in paths or []:
+        path = Path(_expanded_path(path_value))
+        with path.open(encoding="utf-8") as fh:
+            document = json.load(fh)
+        records = document.get("devices") if isinstance(document, dict) else None
+        if not isinstance(records, list):
+            raise ValueError(f"{path}: top-level JSON object must contain a 'devices' list")
+
+        for index, source in enumerate(records):
+            where = f"{path}: devices[{index}]"
+            if not isinstance(source, dict):
+                raise ValueError(f"{where} must be an object")
+            item = dict(source)
+            if "model_family" in item:
+                if "caps_model" in item:
+                    raise ValueError(f"{where}: use only one of model_family and caps_model")
+                item["caps_model"] = item.pop("model_family")
+            missing = sorted(required - set(item))
+            unknown = sorted(set(item) - allowed)
+            if missing:
+                raise ValueError(f"{where}: missing required fields: {', '.join(missing)}")
+            if unknown:
+                raise ValueError(f"{where}: unknown fields: {', '.join(unknown)}")
+
+            item["caps_model"] = normalize_model_family(item.get("caps_model", "bsim4"))
+            item["model_lib"] = _expanded_path(item["model_lib"])
+            item["model_include"] = _expanded_path(item.get("model_include"))
+            if item.get("spiceinit_src") is not None:
+                item["spiceinit_src"] = Path(_expanded_path(item["spiceinit_src"]))
+            item["model_setup_lines"] = [
+                os.path.expandvars(os.path.expanduser(str(line)))
+                for line in item.get("model_setup_lines", [])
+            ]
+            item["simulation_env"] = {
+                str(key): os.path.expandvars(os.path.expanduser(str(value)))
+                for key, value in item.get("simulation_env", {}).items()
+            }
+            item["output_aliases"] = {
+                str(key).lower(): str(value)
+                for key, value in item.get("output_aliases", {}).items()
+            }
+            cfg = DevCfg(**item)
+            if cfg.key in result:
+                raise ValueError(f"{where}: duplicate device key '{cfg.key}'")
+            if cfg.fet_type not in {"nfet", "pfet"}:
+                raise ValueError(f"{where}: fet_type must be 'nfet' or 'pfet'")
+            if not cfg.lib_corner_map:
+                raise ValueError(f"{where}: lib_corner_map cannot be empty")
+            result[cfg.key] = cfg
+    return result
+
+
+def _output_name(cfg: DevCfg, logical_name: str) -> str:
+    """Map a canonical operating-point name to the simulator's output name."""
+    return cfg.output_aliases.get(logical_name.lower(), logical_name)
+
+
+def _id_name(cfg: DevCfg) -> str:
+    return cfg.output_aliases.get("id", cfg.id_col)
+
+
+def _gmb_name(cfg: DevCfg) -> str:
+    return cfg.output_aliases.get("gmb", cfg.gmb_col)
+
+
+def _instance_line(cfg: DevCfg) -> str:
+    if cfg.instance_template:
+        values = {
+            "D": "d", "G": "g", "S": "0", "B": "b",
+            "DEVICE": cfg.device, "LX": "{lx}", "W_UM": cfg.w_um,
+            "NFING": cfg.nfing,
+        }
+        try:
+            return cfg.instance_template.format_map(values)
+        except KeyError as exc:
+            raise ValueError(
+                f"{cfg.key}: unsupported instance_template placeholder {exc}; "
+                "supported placeholders are D, G, S, B, DEVICE, LX, W_UM, NFING"
+            ) from exc
+
+    u = "u" if cfg.has_explicit_u else ""
+    if cfg.pdk == "ihp":
+        if cfg.ihp_nmos_src_first:
+            return (f"XM1 0 g d b {cfg.device} w={cfg.w_um}u l={{lx}}"
+                    f" ng={cfg.nfing} m=1")
+        return (f"XM1 d g 0 b {cfg.device} w={cfg.w_um}u l={{lx}}"
+                f" ng={cfg.nfing} m=1")
+
+    cd = cfg.contact_dist
+    w_val = f"{cfg.w_um}{u}"
+    trail = "mult=1 m=1" if cfg.pdk == "sky130" else "m=1"
+    return (
+        f"XM1 d g 0 b {cfg.device} L={{lx}} W={w_val} nf={cfg.nfing}"
+        f" ad='int((nf+1)/2) * W/nf * {cd}'"
+        f" as='int((nf+2)/2) * W/nf * {cd}'"
+        f" pd='2*int((nf+1)/2) * (W/nf + {cd})'"
+        f" ps='2*int((nf+2)/2) * (W/nf + {cd})'"
+        f" nrd='{cd} / W' nrs='{cd} / W' sa=0 sb=0 sd=0 {trail}"
+    )
+
+
+def _model_block(cfg: DevCfg, corner: str) -> str:
+    lib_corner = cfg.lib_corner_map[corner]
+    if cfg.model_setup_lines:
+        values = {
+            "MODEL_LIB": cfg.model_lib,
+            "MODEL_INCLUDE": cfg.model_include or "",
+            "CORNER": corner,
+            "LIB_CORNER": lib_corner,
+            "DEVICE": cfg.device,
+        }
+        return "\n".join(line.format_map(values) for line in cfg.model_setup_lines)
+    if cfg.model_include:
+        return f".include {cfg.model_include}\n.lib {cfg.model_lib} {lib_corner}"
+    return f".lib {cfg.model_lib} {lib_corner}"
+
+
+def _simulation_env(cfg: DevCfg):
+    env = dict(os.environ)
+    if cfg.pdk == "ihp":
+        env.update({
+            "PDK_ROOT": str(_SPICEINIT_SRC.parents[3]),
+            "PDK": _SPICEINIT_SRC.parts[-4],
+        })
+    env.update(cfg.simulation_env)
+    return env if cfg.pdk == "ihp" or cfg.simulation_env else None
+
 def _vec_str(vals, fmt=".4f"):
     return " ".join(format(v, fmt) for v in vals)
 
@@ -408,13 +608,45 @@ def _l_str(l_vals, explicit_u: bool):
 
 
 def _n_vds_coarse(vds_max: float) -> int:
-    step, py_stop, _ = _VDS_COARSE_CFG[vds_max]
+    step, py_stop, _ = _vds_coarse_cfg(vds_max)
     return len(np.round(np.arange(0.3, py_stop, step), 4))
 
 
-def _build_save_lines(cfg: DevCfg) -> str:
+def _matrix_save_params(cfg: DevCfg) -> list[str]:
+    family = normalize_model_family(cfg.caps_model)
+    logical = list(required_native_fields(family))
+    logical += ["gds", "gm", "gmb", "id", "l", "vth"]
+    if family == "bsim4":
+        logical.append("vdsat")
+    elif family == "psp":
+        logical += ["sid", "sfl"]
+
+    names = []
+    for name in logical:
+        if name == "id":
+            native = _id_name(cfg)
+        elif name == "gmb":
+            native = _gmb_name(cfg)
+        else:
+            native = _output_name(cfg, name)
+        if native not in names:
+            names.append(native)
+    return names
+
+
+def _build_save_lines(cfg: DevCfg, cap_matrix: bool = False) -> str:
     pfx = cfg.save_pfx
-    if cfg.caps_model == "bsim4":
+    if cap_matrix:
+        params = _matrix_save_params(cfg)
+        if normalize_model_family(cfg.caps_model) == "bsim4" and cfg.analysis == "noise":
+            noise_pfx = pfx[1:]
+            noise_saves = (
+                f".save onoise.{noise_pfx}.{_id_name(cfg)}\n"
+                f".save onoise.{noise_pfx}.1overf"
+            )
+        else:
+            noise_saves = ""
+    elif cfg.caps_model == "bsim4":
         params = ["capbd", "capbs", "cdd", "cgb", "cgd", "cgdo",
                   "cgg", "cgs", "cgso", "css", "gds", "gm",
                   cfg.gmb_col, cfg.id_col, "l", "vdsat", "vth"]
@@ -473,12 +705,13 @@ def _append_vds_block(L: list, out_txt: str, wrdata_arg: str,
 
 
 def _append_uniform_vds_block(L: list, out_txt: str, wrdata_arg: str,
-                               vds_max: float, indent: str = "    "):
+                               vds_max: float, vds_step: float,
+                               indent: str = "    "):
     """Append single uniform VDS foreach loop into list L at given indent level."""
     i = indent
-    n_vds = len(build_uniform_vds(vds_max))
+    n_vds = len(build_uniform_vds(vds_max, vds_step))
     L += [
-        f"{i}* Uniform VDS (0–{vds_max}V @{_UNIFORM_STEP*1000:.0f}mV, {n_vds} pts)",
+        f"{i}* Uniform VDS (0–{vds_max}V @{vds_step*1000:.0f}mV, {n_vds} pts)",
         f"{i}foreach var3 $&vd_vec",
         f"{i}  alter vd $var3",
         f"{i}  foreach var4 $&vsb_vec",
@@ -496,7 +729,10 @@ def _append_uniform_vds_block(L: list, out_txt: str, wrdata_arg: str,
 def generate_netlist(cfg: DevCfg, corner: str, temp: int,
                      l_vec, vsb_vec,
                      out_txt: str, netlist_path: str,
-                     vgs_override=None, uniform_grid: bool = False):
+                     vgs_override=None, uniform_grid: bool = False,
+                     vgs_step: float = _UNIFORM_STEP_DEFAULT,
+                     vds_step: float = _UNIFORM_STEP_DEFAULT,
+                     cap_matrix: bool = False):
     """
     Write an ngspice netlist.
 
@@ -504,10 +740,12 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
                            full production runs.
                  : list  → explicit VGS values (compose values …), used for
                            test-run mode with a small number of points.
-    uniform_grid : True  → use a single uniform 25 mV grid for both VGS and VDS
-                           instead of the default non-uniform fine+coarse grids.
+    uniform_grid : True  → use uniform grids for both VGS and VDS (steps
+                           controlled by vgs_step / vds_step) instead of the
+                           default non-uniform fine+coarse grids.
+    vgs_step     : uniform VGS step in volts (only when uniform_grid=True).
+    vds_step     : uniform VDS step in volts (only when uniform_grid=True).
     """
-    lib_corner   = cfg.lib_corner_map[corner]
     l_str        = _l_str(l_vec, cfg.has_explicit_u)
     # ngspice's `compose values` stops parsing at the first negative token.
     # Use start/stop/step form (which handles negatives correctly) for multi-point VSB,
@@ -520,9 +758,9 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
         vsb_stop  = vsb_vec[-1] + vsb_step * 0.01    # tiny overshoot ensures last point included
         vsb_compose = (f"compose vsb_vec start={vsb_start:.4f} "
                        f"stop={vsb_stop:.6f} step={vsb_step:.6f}")
-    _, _, vds_ng_stop  = _VDS_COARSE_CFG[cfg.vds_max]
-    vds_cs       = _VDS_COARSE_CFG[cfg.vds_max][0]
-    save_lines   = _build_save_lines(cfg)
+    _, _, vds_ng_stop = _vds_coarse_cfg(cfg.vds_max)
+    vds_cs = _vds_coarse_cfg(cfg.vds_max)[0]
+    save_lines   = _build_save_lines(cfg, cap_matrix=cap_matrix)
     init_lx      = f"{l_vec[0]}u" if cfg.has_explicit_u else str(l_vec[0])
 
     # ── NFET vs PFET biasing topology ─────────────────────────────────────────
@@ -539,27 +777,7 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
         vb_line = "vb b 0 0"
 
     # ── Instance line ──────────────────────────────────────────────────────────
-    u = "u" if cfg.has_explicit_u else ""
-    if cfg.pdk == "ihp":
-        if cfg.ihp_nmos_src_first:   # IHP NMOS: subcircuit port order is s g d b
-            inst = (f"XM1 0 g d b {cfg.device} w={cfg.w_um}u l={{lx}}"
-                    f" ng={cfg.nfing} m=1")
-        else:                         # IHP PMOS: d g 0 b
-            inst = (f"XM1 d g 0 b {cfg.device} w={cfg.w_um}u l={{lx}}"
-                    f" ng={cfg.nfing} m=1")
-    else:  # sky130 or gf180
-        cd = cfg.contact_dist
-        w_val = f"{cfg.w_um}{u}"
-        # sky130 subcircuits accept mult=1; GF180 non-DSS subcircuits do not
-        trail = "mult=1 m=1" if cfg.pdk == "sky130" else "m=1"
-        inst = (
-            f"XM1 d g 0 b {cfg.device} L={{lx}} W={w_val} nf={cfg.nfing}"
-            f" ad='int((nf+1)/2) * W/nf * {cd}'"
-            f" as='int((nf+2)/2) * W/nf * {cd}'"
-            f" pd='2*int((nf+1)/2) * (W/nf + {cd})'"
-            f" ps='2*int((nf+2)/2) * (W/nf + {cd})'"
-            f" nrd='{cd} / W' nrs='{cd} / W' sa=0 sb=0 sd=0 {trail}"
-        )
+    inst = _instance_line(cfg)
 
     # ── Analysis directive ─────────────────────────────────────────────────────
     if cfg.analysis == "noise":
@@ -570,17 +788,7 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
         wrdata_arg    = "all"
 
     # ── Model loading ──────────────────────────────────────────────────────────
-    if cfg.pdk == "gf180":
-        # The unified corner section (typical/ff/ss/sf/fs) already includes
-        # nfet_03v3_t + pfet_03v3_t + noise_corner + fets_mm in one call.
-        # This matches the reference techsweep files exactly.
-        lib_block = (f".include {cfg.model_include}\n"
-                     f".lib {cfg.model_lib} {lib_corner}")
-    elif cfg.model_include:
-        lib_block = (f".include {cfg.model_include}\n"
-                     f".lib {cfg.model_lib} {lib_corner}")
-    else:
-        lib_block = f".lib {cfg.model_lib} {lib_corner}"
+    lib_block = _model_block(cfg, corner)
 
     # ── Build control block lines ──────────────────────────────────────────────
     ctrl = []
@@ -595,16 +803,16 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
     ]
 
     if uniform_grid:
-        vd_ng_stop = round(cfg.vds_max + _UNIFORM_STEP * 0.01, 6)
-        n_vds = len(build_uniform_vds(cfg.vds_max))
+        vd_ng_stop = round(cfg.vds_max + vds_step * 0.01, 6)
+        n_vds = len(build_uniform_vds(cfg.vds_max, vds_step))
         ctrl += [
-            f"* Uniform VDS (0–{cfg.vds_max}V @{_UNIFORM_STEP*1000:.0f}mV, {n_vds} pts)",
-            f"compose vd_vec start=0 stop={vd_ng_stop:.6f} step={_UNIFORM_STEP}",
+            f"* Uniform VDS (0–{cfg.vds_max}V @{vds_step*1000:.0f}mV, {n_vds} pts)",
+            f"compose vd_vec start=0 stop={vd_ng_stop:.6f} step={vds_step}",
         ]
     else:
         ctrl += [
-            f"* Fine VDS (0–0.295V @5mV, 60 pts)",
-            f"compose vd_fine_vec   start=0   stop=0.2951       step=0.005",
+            "* Fine VDS (0–0.295V @5mV, 60 pts)",
+            "compose vd_fine_vec   start=0   stop=0.2951       step=0.005",
             f"* Coarse VDS (0.3–{cfg.vds_max}V @{vds_cs}V, {_n_vds_coarse(cfg.vds_max)} pts)",
             f"compose vd_coarse_vec start=0.3 stop={vds_ng_stop} step={vds_cs}",
         ]
@@ -613,15 +821,15 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
         # Test-mode: explicit VGS list
         ctrl.append(f"compose vg_vec values {_vec_str(vgs_override)}")
     elif uniform_grid:
-        vg_ng_stop = round(cfg.vgs_max + _UNIFORM_STEP * 0.01, 6)
-        n_vgs = len(build_uniform_vgs(cfg.vgs_max))
+        vg_ng_stop = round(cfg.vgs_max + vgs_step * 0.01, 6)
+        n_vgs = len(build_uniform_vgs(cfg.vgs_max, vgs_step))
         ctrl += [
-            f"* Uniform VGS (0–{cfg.vgs_max}V @{_UNIFORM_STEP*1000:.0f}mV, {n_vgs} pts)",
-            f"compose vg_vec start=0 stop={vg_ng_stop:.6f} step={_UNIFORM_STEP}",
+            f"* Uniform VGS (0–{cfg.vgs_max}V @{vgs_step*1000:.0f}mV, {n_vgs} pts)",
+            f"compose vg_vec start=0 stop={vg_ng_stop:.6f} step={vgs_step}",
         ]
     else:
         # Full non-uniform VGS mode
-        fine_py, fine_ng, cs_start, cs_step, cs_py, cs_ng = _VGS_COARSE_CFG[cfg.vgs_max]
+        fine_py, fine_ng, cs_start, cs_step, cs_py, cs_ng = _vgs_coarse_cfg(cfg.vgs_max)
         n_vf = _n_vgs_fine(cfg.vgs_max)
         n_vc = _n_vgs_coarse(cfg.vgs_max)
         ctrl += [
@@ -639,11 +847,11 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
         _append_vds_block(ctrl, out_txt, wrdata_arg, vds_cs, cfg.vds_max, indent="    ")
         ctrl.append("  end")
     elif uniform_grid:
-        n_vgs = len(build_uniform_vgs(cfg.vgs_max))
+        n_vgs = len(build_uniform_vgs(cfg.vgs_max, vgs_step))
         ctrl.append(f"  * === Uniform VGS sweep ({n_vgs} pts) ===")
         ctrl.append("  foreach var2 $&vg_vec")
         ctrl.append("    alter vg $var2")
-        _append_uniform_vds_block(ctrl, out_txt, wrdata_arg, cfg.vds_max, indent="    ")
+        _append_uniform_vds_block(ctrl, out_txt, wrdata_arg, cfg.vds_max, vds_step, indent="    ")
         ctrl.append("  end")
     else:
         ctrl.append(f"  * === Fine VGS sweep ({n_vf} pts) ===")
@@ -662,7 +870,8 @@ def generate_netlist(cfg: DevCfg, corner: str, temp: int,
     # ── Assemble full netlist ──────────────────────────────────────────────────
     header = [
         f"** LUT Characterization: {cfg.device}  corner={corner}  T={temp}C",
-        f"** PDK: {cfg.pdk}  Analysis: {cfg.analysis}",
+        f"** PDK: {cfg.pdk}  Analysis: {cfg.analysis}  "
+        f"Capacitance: {CAP_PROFILE_MATRIX9 if cap_matrix else 'legacy'}",
         "**.subckt lut_char",
         hn_line, vg_line, vd_line, vb_line,
         inst, "",
@@ -714,10 +923,96 @@ def run_ngspice(netlist_path: str, log_path: str, label: str = "",
         return False
 
 
+def probe_capacitance_outputs(cfg: DevCfg, corner: str, temp: int,
+                              sim_dir: Path) -> None:
+    """Fail before a sweep when a model cannot expose the Matrix9 inputs."""
+    sim_dir.mkdir(parents=True, exist_ok=True)
+    setup_spiceinit(cfg, sim_dir)
+
+    dev_safe = cfg.device.replace(':', '_').replace('/', '_')
+    stem = f"cap_probe_{dev_safe}_{corner}_T{temp}"
+    netlist_path = sim_dir / f"{stem}.spice"
+    output_path = sim_dir / f"{stem}.txt"
+    log_path = sim_dir / f"{stem}.log"
+    output_path.unlink(missing_ok=True)
+
+    is_pmos = cfg.fet_type == "pfet"
+    vg_value = cfg.vgs_max * 0.6
+    vd_value = cfg.vds_max * 0.5
+    if is_pmos:
+        voltage_lines = [
+            f"vg 0 g DC {vg_value}",
+            f"vd 0 d DC {vd_value}",
+            "vb 0 b DC 0",
+        ]
+    else:
+        voltage_lines = [
+            f"vg g 0 DC {vg_value}",
+            f"vd d 0 DC {vd_value}",
+            "vb b 0 DC 0",
+        ]
+
+    init_lx = f"{cfg.l_vec[0]}u" if cfg.has_explicit_u else str(cfg.l_vec[0])
+    save_lines = "\n".join(
+        f".save {cfg.save_pfx}[{name}]" for name in _matrix_save_params(cfg)
+    )
+    content = "\n".join([
+        f"** Matrix9 capability probe: {cfg.key}",
+        *voltage_lines,
+        _instance_line(cfg),
+        f".param lx={init_lx}",
+        f".temp {temp}",
+        ".op",
+        _model_block(cfg, corner),
+        save_lines,
+        ".control",
+        "set wr_singlescale",
+        "set wr_vecnames",
+        "op",
+        f"wrdata {output_path} all",
+        "quit",
+        ".endc",
+        ".end",
+        "",
+    ])
+    netlist_path.write_text(content)
+
+    if not run_ngspice(str(netlist_path), str(log_path), label="cap-probe",
+                       env=_simulation_env(cfg), sim_dir=sim_dir):
+        raise RuntimeError(
+            f"{cfg.key}: Matrix9 capability probe failed; see {log_path}"
+        )
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"{cfg.key}: Matrix9 capability probe produced no data; see {log_path}"
+        )
+
+    columns = pd.read_csv(output_path, sep=r'\s+', engine='python', nrows=1).columns
+    cleaned = columns.str.replace(cfg.save_pfx, '', regex=False)
+    if cfg.save_pfx:
+        cleaned = cleaned.str.replace(cfg.save_pfx[1:], '', regex=False)
+    cleaned = cleaned.str.removeprefix('@').str.removeprefix('[').str.removesuffix(']')
+    available = set(cleaned)
+    family = normalize_model_family(cfg.caps_model)
+    required = {_output_name(cfg, name) for name in required_native_fields(family)}
+    required.update({
+        _id_name(cfg), _gmb_name(cfg), _output_name(cfg, 'gm'),
+        _output_name(cfg, 'gds'), _output_name(cfg, 'vth'),
+    })
+    missing = sorted(required - available)
+    if missing:
+        raise RuntimeError(
+            f"{cfg.key}: model/simulator does not expose required Matrix9 outputs: "
+            f"{', '.join(missing)}. See {log_path}"
+        )
+    print(f"  [probe] Matrix9 outputs available for {cfg.key} ({family})")
+
+
 # ── Parser and .mat writer ─────────────────────────────────────────────────────
 
 def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
-                   l_vec, vgs_vec, vsb_vec, mat_path: str, vds_vec=None):
+                   l_vec, vgs_vec, vsb_vec, mat_path: str, vds_vec=None,
+                   cap_matrix: bool = False):
     print(f"  [read] {txt_path}")
     df_raw = pd.read_csv(txt_path, sep=r'\s+', engine='python')
 
@@ -756,14 +1051,39 @@ def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
     actual   = len(df)
     print(f"  [chk ] Rows: expected={expected}, actual={actual}")
     if actual != expected:
-        print(f"  [WARN] Row mismatch — tensor reshape may fail!")
+        print("  [WARN] Row mismatch — tensor reshape may fail!")
 
     def R(col):
+        if col not in df.columns:
+            raise ValueError(
+                f"{cfg.key}: simulator output is missing '{col}'. "
+                f"Available columns: {list(df.columns)}"
+            )
         return np.reshape(df[col].values[:expected], dims)
 
     # Composite capacitances
     vdsat = None
-    if cfg.caps_model == "bsim4":
+    extra_fields = {}
+    metadata = {}
+    if cap_matrix:
+        family = normalize_model_family(cfg.caps_model)
+        native = {
+            name: R(_output_name(cfg, name))
+            for name in required_native_fields(family)
+        }
+        cap_fields = matrix9_to_fields(native_to_matrix9(family, native))
+        metadata = capacitance_metadata(family, cfg.bulk_terminal_alias)
+
+        if 'nid' in df.columns and 'n1overf' in df.columns:
+            extra_fields["STH"] = R('nid')**2
+            extra_fields["SFL"] = R('n1overf')**2
+        elif _output_name(cfg, 'sid') in df.columns and _output_name(cfg, 'sfl') in df.columns:
+            extra_fields["STH"] = R(_output_name(cfg, 'sid'))
+            extra_fields["SFL"] = R(_output_name(cfg, 'sfl'))
+        vdsat_col = _output_name(cfg, 'vdsat')
+        if vdsat_col in df.columns:
+            extra_fields["VDSAT"] = R(vdsat_col)
+    elif cfg.caps_model == "bsim4":
         cgg = R('cgg') + R('cgdo') + R('cgso')
         cgb = -R('cgb')
         cgd = -R('cgd') + R('cgdo')
@@ -783,6 +1103,19 @@ def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
         sth = R('sid')
         sfl = R('sfl')
 
+    if not cap_matrix:
+        cap_fields = {
+            "CGG": cgg,
+            "CGB": cgb,
+            "CGD": cgd,
+            "CGS": cgs,
+            "CDD": cdd,
+            "CSS": css,
+        }
+        extra_fields.update({"STH": sth, "SFL": sfl})
+        if vdsat is not None:
+            extra_fields["VDSAT"] = vdsat
+
     vsb_mat = np.abs(np.array(vsb_vec))
 
     dic = {
@@ -795,22 +1128,15 @@ def parse_and_save(cfg: DevCfg, txt_path: str, corner: str, temp: int,
         "L":      np.array(l_vec),
         "W":      float(cfg.w_um),
         "NFING":  float(cfg.nfing),
-        "ID":     R(cfg.id_col),
-        "VT":     R('vth'),
-        "GM":     R('gm'),
-        "GMB":    R(cfg.gmb_col),
-        "GDS":    R('gds'),
-        "CGG":    cgg,
-        "CGB":    cgb,
-        "CGD":    cgd,
-        "CGS":    cgs,
-        "CDD":    cdd,
-        "CSS":    css,
-        "STH":    sth,
-        "SFL":    sfl,
+        "ID":     R(_id_name(cfg) if cap_matrix else cfg.id_col),
+        "VT":     R(_output_name(cfg, 'vth') if cap_matrix else 'vth'),
+        "GM":     R(_output_name(cfg, 'gm') if cap_matrix else 'gm'),
+        "GMB":    R(_gmb_name(cfg) if cap_matrix else cfg.gmb_col),
+        "GDS":    R(_output_name(cfg, 'gds') if cap_matrix else 'gds'),
     }
-    if vdsat is not None:
-        dic["VDSAT"] = vdsat
+    dic.update(cap_fields)
+    dic.update(extra_fields)
+    dic.update(metadata)
 
     dev_key  = cfg.device.replace('-', '_').replace(' ', '_')
     sign     = 'p' if temp >= 0 else 'm'
@@ -846,7 +1172,7 @@ def validate_test_run(dic, dims, cfg: DevCfg):
     last_fine   = float(vds_all[fine_mask][-1])
     first_c     = float(vds_all[coarse_mask][0])
 
-    print(f"\n[TC2] VDS Stitching")
+    print("\n[TC2] VDS Stitching")
     print(f"  Fine pts   (< 0.3 V) : {n_fine}   (expected 60)")
     print(f"  Coarse pts (>= 0.3 V): {n_c}  (expected {n_vds_c})")
     print(f"  Total VDS points     : {n_total} (expected {60+n_vds_c})")
@@ -859,7 +1185,7 @@ def validate_test_run(dic, dims, cfg: DevCfg):
     # TC3 — tensor shape
     expected_shape = tuple(dims)
     actual_shape   = dic['ID'].shape
-    print(f"\n[TC3] Tensor Shape")
+    print("\n[TC3] Tensor Shape")
     print(f"  Expected : {expected_shape}")
     print(f"  Actual   : {actual_shape}")
     tc3 = (actual_shape == expected_shape)
@@ -881,7 +1207,7 @@ def validate_test_run(dic, dims, cfg: DevCfg):
     id_350 = float(id_curve[i_350])
     jump   = abs(id_300 - id_295) / (abs(id_295) + 1e-30)
 
-    print(f"\n[TC4] |ID| Continuity at |VDS|=0.3 V Boundary")
+    print("\n[TC4] |ID| Continuity at |VDS|=0.3 V Boundary")
     print(f"  L={l_arr[i_L]:.2f}µm, |VGS|={vgs_arr[i_VGS]:.3f}V, VSB=0V")
     print(f"  |ID| @ 0.295 V = {id_295: .6e} A")
     print(f"  |ID| @ 0.300 V = {id_300: .6e} A")
@@ -919,13 +1245,14 @@ def _run_one_pvt(args):
     Run one (corner, temp) PVT job: generate netlist → ngspice → parse → save.
     Returns (corner, temp, mat_path) on success, None on failure.
     """
-    cfg, corner, temp, l_vec, vsb_vec, vgs_override, test_mode, uniform_grid, base_sim_dir, base_out_dir = args
+    (cfg, corner, temp, l_vec, vsb_vec, vgs_override, test_mode, uniform_grid,
+     vgs_step, vds_step, base_sim_dir, base_out_dir, cap_matrix) = args
 
     sim_dir = base_sim_dir / "uniform" if uniform_grid else base_sim_dir
     out_dir = base_out_dir / "uniform" if uniform_grid else base_out_dir
     sim_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
-    if cfg.pdk == "ihp":
+    if cfg.spiceinit_src is not None:
         setup_spiceinit(cfg, sim_dir)
 
     sign     = 'p' if temp >= 0 else 'm'
@@ -943,10 +1270,13 @@ def _run_one_pvt(args):
     else:
         l_suffix = ""
 
-    out_txt      = str(sim_dir / f"techsweep_{dev_safe}_{tag}{l_suffix}.txt")
-    netlist_path = str(sim_dir / f"techsweep_{dev_safe}_{tag}{l_suffix}.spice")
-    log_path     = str(sim_dir / f"techsweep_{dev_safe}_{tag}{l_suffix}.log")
-    mat_path     = str(out_dir / f"{dev_safe}_{tag}{l_suffix}.mat")
+    grid_suffix = _grid_suffix(uniform_grid, vgs_step, vds_step, len(vsb_vec))
+    profile_suffix = "_cm9" if cap_matrix else ""
+
+    out_txt      = str(sim_dir / f"techsweep_{dev_safe}_{tag}{grid_suffix}{profile_suffix}{l_suffix}.txt")
+    netlist_path = str(sim_dir / f"techsweep_{dev_safe}_{tag}{grid_suffix}{profile_suffix}{l_suffix}.spice")
+    log_path     = str(sim_dir / f"techsweep_{dev_safe}_{tag}{grid_suffix}{profile_suffix}{l_suffix}.log")
+    mat_path     = str(out_dir / f"{dev_safe}_{tag}{grid_suffix}{profile_suffix}{l_suffix}.mat")
 
     _p = Path(mat_path)
     if _p.exists() and _p.stat().st_size > 0:
@@ -957,11 +1287,12 @@ def _run_one_pvt(args):
     if vgs_override is not None:
         parse_vgs = list(vgs_override)
     elif uniform_grid:
-        parse_vgs = list(build_uniform_vgs(cfg.vgs_max))
+        parse_vgs = list(build_uniform_vgs(cfg.vgs_max, vgs_step))
     else:
         parse_vgs = list(build_vgs_all(cfg.vgs_max))
 
-    vds_all = build_uniform_vds(cfg.vds_max) if uniform_grid else build_vds_all(cfg.vds_max)
+    vds_all = (build_uniform_vds(cfg.vds_max, vds_step) if uniform_grid
+               else build_vds_all(cfg.vds_max))
 
     n_sim = len(l_vec) * len(parse_vgs) * len(vds_all) * len(vsb_vec)
     print(f"\n{'='*68}")
@@ -974,13 +1305,11 @@ def _run_one_pvt(args):
 
     generate_netlist(cfg, corner, temp, l_vec, vsb_vec,
                      out_txt, netlist_path,
-                     vgs_override=vgs_override, uniform_grid=uniform_grid)
+                     vgs_override=vgs_override, uniform_grid=uniform_grid,
+                     vgs_step=vgs_step, vds_step=vds_step,
+                     cap_matrix=cap_matrix)
 
-    sim_env = None
-    if cfg.pdk == "ihp":
-        sim_env = {**os.environ,
-                   "PDK_ROOT": str(_SPICEINIT_SRC.parents[3]),  # …/IHP-Open-PDK
-                   "PDK":      _SPICEINIT_SRC.parts[-4]}         # ihp-sg13g2
+    sim_env = _simulation_env(cfg)
     ok = run_ngspice(netlist_path, log_path, label=label, env=sim_env, sim_dir=sim_dir)
     if not ok:
         print(f"  [{label}] [SKIP] ngspice failed — see {log_path}")
@@ -991,7 +1320,8 @@ def _run_one_pvt(args):
         return None
 
     dic, dims = parse_and_save(cfg, out_txt, corner, temp,
-                               l_vec, parse_vgs, vsb_vec, mat_path, vds_vec=vds_all)
+                               l_vec, parse_vgs, vsb_vec, mat_path, vds_vec=vds_all,
+                               cap_matrix=cap_matrix)
     if test_mode:
         validate_test_run(dic, dims, cfg)
 
@@ -1038,7 +1368,10 @@ def _smoke_grids(cfg: DevCfg):
 def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
             max_workers=None, corners_per_batch=1, smoke_mode=False,
             uniform_grid: bool = False,
-            base_sim_dir: Path = None, base_out_dir: Path = None):
+            vgs_step: float = _UNIFORM_STEP_DEFAULT,
+            vds_step: float = _UNIFORM_STEP_DEFAULT,
+            base_sim_dir: Path = None, base_out_dir: Path = None,
+            cap_matrix: bool = False):
     """
     Orchestrate PVT sweep, running (corner, temp) jobs in parallel.
 
@@ -1048,7 +1381,9 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
     test_mode        : run a micro-sweep (2L × 2VGS × 1VSB, TT/27°C) for validation.
     smoke_mode       : ultra-fast smoke test (1L × 1VGS × fullVDS × 1VSB, TT/27°C).
     corners_per_batch: number of corners to run in each sequential batch.
-    uniform_grid     : use a uniform 25 mV step for both VGS and VDS.
+    uniform_grid     : use uniform grids for both VGS and VDS (steps below).
+    vgs_step/vds_step: uniform VGS/VDS step in volts (default 25 mV). Only used
+                       when uniform_grid=True.
     base_sim_dir     : root directory for .spice/.txt/.log files (default: SIM_DIR).
     base_out_dir     : root directory for .mat output files (default: OUT_DIR).
     """
@@ -1063,12 +1398,18 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
     out_dir = base_out_dir / "uniform" if uniform_grid else base_out_dir
     sim_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
-    if cfg.pdk == "ihp":
+    if cfg.spiceinit_src is not None:
         setup_spiceinit(cfg, sim_dir)
 
+    validation_corner = "TT" if "TT" in cfg.lib_corner_map else corners[0]
+    if cap_matrix:
+        probe_corner = validation_corner if test_mode or smoke_mode else corners[0]
+        probe_temp = 27 if test_mode or smoke_mode else (temps[0] if temps else 27)
+        probe_capacitance_outputs(cfg, probe_corner, probe_temp, sim_dir)
+
     if uniform_grid:
-        vgs_vec = build_uniform_vgs(cfg.vgs_max)
-        vds_all = build_uniform_vds(cfg.vds_max)
+        vgs_vec = build_uniform_vgs(cfg.vgs_max, vgs_step)
+        vds_all = build_uniform_vds(cfg.vds_max, vds_step)
     else:
         vgs_vec = build_vgs_all(cfg.vgs_max)
         vds_all = build_vds_all(cfg.vds_max)
@@ -1080,8 +1421,8 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
                   + (f", partial {len(l_vec)}/{len(cfg.l_vec)})" if len(l_vec) < len(cfg.l_vec) else ")"))
         print(f"  L      : {l_info}")
         if uniform_grid:
-            print(f"  VGS    : {len(vgs_vec)} pts (0–{cfg.vgs_max}V @25mV uniform)")
-            print(f"  VDS    : {len(vds_all)} pts (0–{cfg.vds_max}V @25mV uniform)")
+            print(f"  VGS    : {len(vgs_vec)} pts (0–{cfg.vgs_max}V @{vgs_step*1000:.0f}mV uniform)")
+            print(f"  VDS    : {len(vds_all)} pts (0–{cfg.vds_max}V @{vds_step*1000:.0f}mV uniform)")
         else:
             print(f"  VGS    : {_n_vgs_fine(cfg.vgs_max)} fine pts "
                   f"(0–{_vgs_fine_max(cfg.vgs_max):.3f}V @10mV) + "
@@ -1099,16 +1440,21 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
     # Build batch list
     if test_mode:
         l_t, vgs_t, vsb_t = _test_grids(cfg)
-        batches = [("test", [(cfg, "TT", 27, l_t, vsb_t, vgs_t, True, False, base_sim_dir, base_out_dir)])]
+        batches = [("test", [(cfg, validation_corner, 27, l_t, vsb_t, vgs_t, True, False,
+                              vgs_step, vds_step, base_sim_dir, base_out_dir,
+                              cap_matrix)])]
     elif smoke_mode:
         l_s, vgs_s, vsb_s = _smoke_grids(cfg)
-        batches = [("smoke", [(cfg, "TT", 27, l_s, vsb_s, vgs_s, False, False, base_sim_dir, base_out_dir)])]
+        batches = [("smoke", [(cfg, validation_corner, 27, l_s, vsb_s, vgs_s, False, False,
+                               vgs_step, vds_step, base_sim_dir, base_out_dir,
+                               cap_matrix)])]
     else:
         corner_batches = [corners[i:i+corners_per_batch]
                           for i in range(0, len(corners), corners_per_batch)]
         batches = [
             (batch_corners, [
-                (cfg, corner, temp, l_vec, cfg.vsb_vec, None, False, uniform_grid, base_sim_dir, base_out_dir)
+                (cfg, corner, temp, l_vec, cfg.vsb_vec, None, False, uniform_grid,
+                 vgs_step, vds_step, base_sim_dir, base_out_dir, cap_matrix)
                 for corner in batch_corners
                 for temp in temps
             ])
@@ -1167,11 +1513,23 @@ def main():
     )
     ap.add_argument("--list", action="store_true",
                     help="Print all available device keys and exit")
-    ap.add_argument("--device", metavar="PDK:DEVICE",
-                    help="Device key, e.g. sky130:nfet_01v8")
+    ap.add_argument("--device-config", action="append", default=[], metavar="JSON",
+                    help="Load additional device definitions from JSON. Repeat this "
+                         "option to load multiple files; duplicate keys are rejected.")
+    ap.add_argument("--device", nargs="+", metavar="PDK:DEVICE",
+                    help="One or more device keys. First entry must include the "
+                         "PDK (e.g. 'sky130:nfet_01v8'); subsequent bare names "
+                         "inherit the most-recent PDK. Use 'PDK:' (trailing "
+                         "colon, no device) to switch PDK without selecting a "
+                         "device. Examples: "
+                         "'--device sky130:nfet_01v8 nfet_01v8_lvt pfet_01v8' or "
+                         "'--device sky130: nfet_01v8 pfet_01v8 ihp: sg13_lv_pmos'.")
     ap.add_argument("--node", metavar="NODE",
-                    choices=["sky130", "ihp", "gf180"],
-                    help="Run all devices for a specific PDK node (sky130, ihp, gf180)")
+                    help="Run all devices for a specific PDK node, including nodes "
+                         "loaded through --device-config")
+    ap.add_argument("--cap-matrix", action="store_true",
+                    help="Generate the opt-in signed Matrix9 total-capacitance profile. "
+                         "Outputs use a _cm9 filename suffix; legacy mode is unchanged.")
     ap.add_argument("--test-run", action="store_true",
                     help="Micro-sweep validation (2 L, 2 VGS, 1 VSB, TT/27°C)")
     ap.add_argument("--smoke", action="store_true",
@@ -1199,8 +1557,15 @@ def main():
                          "(e.g. 5 gives [0, -VDD/4, ..., -VDD]). "
                          "Default: use each device's built-in vsb_vec.")
     ap.add_argument("--uniform-grid", action="store_true",
-                    help="Use a uniform 25 mV step for both VGS and VDS "
-                         "instead of the default non-uniform fine+coarse grid.")
+                    help="Use uniform grids for both VGS and VDS instead of the "
+                         "default non-uniform fine+coarse grid. Per-axis step "
+                         "is controlled by --vgs-step / --vds-step.")
+    ap.add_argument("--vgs-step", type=float, default=_UNIFORM_STEP_DEFAULT, metavar="V",
+                    help=f"Uniform VGS step in volts (default {_UNIFORM_STEP_DEFAULT}). "
+                         "Only used with --uniform-grid.")
+    ap.add_argument("--vds-step", type=float, default=_UNIFORM_STEP_DEFAULT, metavar="V",
+                    help=f"Uniform VDS step in volts (default {_UNIFORM_STEP_DEFAULT}). "
+                         "Only used with --uniform-grid.")
     ap.add_argument("--output-dir", metavar="DIR", default=None,
                     help=f"Directory for .mat output files (default: {OUT_DIR}). "
                          "A 'uniform/' subdirectory is created automatically when "
@@ -1210,13 +1575,18 @@ def main():
                          f"(default: {SIM_DIR}).")
     args = ap.parse_args()
 
+    try:
+        devices = load_device_configs(args.device_config)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        ap.error(f"invalid --device-config: {exc}")
+
     if STOP_FILE.exists():
         print(f"  [WARN] Removing stale STOP file from previous run: {STOP_FILE}")
         STOP_FILE.unlink()
 
     if args.list:
         print(f"\nAvailable devices  (CPU count: {os.cpu_count()}):\n")
-        for k, c in DEVICES.items():
+        for k, c in devices.items():
             vgs_all = build_vgs_all(c.vgs_max)
             vds_all = build_vds_all(c.vds_max)
             print(f"  {k:<35}  PDK={c.pdk:<7} type={c.fet_type}  "
@@ -1229,15 +1599,34 @@ def main():
     if args.device and args.node:
         ap.error("--device and --node are mutually exclusive.")
     elif args.device:
-        if args.device not in DEVICES:
-            ap.error(f"Unknown device '{args.device}'. Use --list to see available keys.")
-        device_keys = [args.device]
+        device_keys = []
+        current_pdk = None
+        for tok in args.device:
+            if ":" in tok:
+                pdk_part, dev_part = tok.split(":", 1)
+                if not pdk_part:
+                    ap.error(f"--device '{tok}': missing PDK before ':'.")
+                current_pdk = pdk_part
+                if not dev_part:
+                    continue  # 'PDK:' alone — sets PDK for subsequent bare names
+                dev = dev_part
+            else:
+                if current_pdk is None:
+                    ap.error(f"--device '{tok}' has no PDK prefix and no "
+                             f"preceding 'PDK:DEVICE' entry to inherit from.")
+                dev = tok
+            key = f"{current_pdk}:{dev}"
+            if key not in devices:
+                ap.error(f"Unknown device '{key}'. Use --list to see available keys.")
+            device_keys.append(key)
+        if not device_keys:
+            ap.error("--device: no devices selected (only PDK prefixes given).")
     elif args.node:
-        device_keys = [k for k, c in DEVICES.items() if c.pdk == args.node]
+        device_keys = [k for k, c in devices.items() if c.pdk == args.node]
         if not device_keys:
             ap.error(f"No devices found for node '{args.node}'.")
     else:
-        device_keys = list(DEVICES.keys())
+        device_keys = list(devices.keys())
 
     n_devices = len(device_keys)
     for dev_idx, dev_key in enumerate(device_keys):
@@ -1245,7 +1634,7 @@ def main():
             print("\n[STOP] STOP file detected — aborting remaining devices")
             break
 
-        cfg = DEVICES[dev_key]
+        cfg = devices[dev_key]
 
         if args.vsb_points is not None:
             if args.vsb_points < 1:
@@ -1284,8 +1673,8 @@ def main():
 
         if not args.test_run and not args.smoke:
             if args.uniform_grid:
-                vgs_all = build_uniform_vgs(cfg.vgs_max)
-                vds_all = build_uniform_vds(cfg.vds_max)
+                vgs_all = build_uniform_vgs(cfg.vgs_max, args.vgs_step)
+                vds_all = build_uniform_vds(cfg.vds_max, args.vds_step)
             else:
                 vgs_all = build_vgs_all(cfg.vgs_max)
                 vds_all = build_vds_all(cfg.vds_max)
@@ -1296,14 +1685,15 @@ def main():
             print(f"\nPDK: {cfg.pdk}  Device: {cfg.device}")
             print(f"L:   {l_info}")
             if args.uniform_grid:
-                print(f"VGS: {len(vgs_all)} pts (0–{cfg.vgs_max}V @25mV uniform)")
-                print(f"VDS: {len(vds_all)} pts (0–{cfg.vds_max}V @25mV uniform)")
+                print(f"VGS: {len(vgs_all)} pts (0–{cfg.vgs_max}V @{args.vgs_step*1000:.0f}mV uniform)")
+                print(f"VDS: {len(vds_all)} pts (0–{cfg.vds_max}V @{args.vds_step*1000:.0f}mV uniform)")
             else:
                 print(f"VGS: {_n_vgs_fine(cfg.vgs_max)} fine (0–{_vgs_fine_max(cfg.vgs_max):.2f}V @10mV) + "
                       f"{_n_vgs_coarse(cfg.vgs_max)} coarse = {len(vgs_all)} pts")
                 print(f"VDS: 60 fine (0–0.295V @5mV) + "
                       f"{_n_vds_coarse(cfg.vds_max)} coarse = {len(vds_all)} pts")
             print(f"VSB: {len(cfg.vsb_vec)} pts  {cfg.vsb_vec}")
+            print(f"Capacitance: {'Matrix9 (_cm9)' if args.cap_matrix else 'legacy'}")
             print(f"Corners: {corners}  Temps: {args.temps}  PVT jobs: {n_pvt}")
             cap = args.workers if args.workers is not None else N_WORKERS_DEFAULT
             print(f"Simulations per job: {n_sim:,}  "
@@ -1315,8 +1705,11 @@ def main():
                 max_workers=args.workers,
                 corners_per_batch=args.corners_per_batch,
                 uniform_grid=args.uniform_grid,
+                vgs_step=args.vgs_step,
+                vds_step=args.vds_step,
                 base_sim_dir=Path(args.sim_dir) if args.sim_dir else None,
-                base_out_dir=Path(args.output_dir) if args.output_dir else None)
+                base_out_dir=Path(args.output_dir) if args.output_dir else None,
+                cap_matrix=args.cap_matrix)
 
 
 if __name__ == "__main__":

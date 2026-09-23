@@ -1,85 +1,129 @@
 #!/usr/bin/env python3
-"""
-merge_mats.py — Merge partial L-range .mat files into one.
-
-Usage:
-    python merge_mats.py PARTIAL1.mat PARTIAL2.mat ... --out MERGED.mat
-
-Each input file must have been produced by run_lut_char_all.py with --l-range.
-Files are concatenated along the L axis (axis 0) in the order given;
-pass them in ascending L order.
-
-Example:
-    python merge_mats.py \\
-        output/nfet_03v3_TT_Tp27_L280to600nm.mat \\
-        output/nfet_03v3_TT_Tp27_L700to3000nm.mat \\
-        --out output/nfet_03v3_TT_Tp27.mat
-"""
+"""Merge partial L-range MAT files produced by run_lut_char_all.py."""
 
 import argparse
 import sys
+
 import numpy as np
 import scipy.io
 
-DATA_KEYS = ['ID', 'VT', 'GM', 'GMB', 'GDS',
-             'CGG', 'CGB', 'CGD', 'CGS', 'CDD', 'CSS',
-             'STH', 'SFL']
+from capacitance import CAP_PROFILE_LEGACY, CAP_PROFILE_MATRIX9, LEGACY_CAP_KEYS, MATRIX9_KEYS
+
+
+CORE_DATA_KEYS = ("ID", "VT", "GM", "GMB", "GDS")
+OPTIONAL_DATA_KEYS = ("STH", "SFL", "VDSAT")
+DATA_KEYS = list(CORE_DATA_KEYS + LEGACY_CAP_KEYS + OPTIONAL_DATA_KEYS)
+PROFILE_METADATA_KEYS = (
+    "CAPACITANCE_PROFILE", "CAPACITANCE_SCHEMA_VERSION",
+    "CAPACITANCE_CONVENTION", "CAPACITANCE_TERMINALS",
+    "CAPACITANCE_COMPONENTS", "MODEL_FAMILY", "BULK_TERMINAL_ALIAS",
+)
+
+
+def _scalar(value):
+    arr = np.asarray(value)
+    return arr.flat[0].item() if arr.size else None
+
+
+def _profile(data):
+    return str(_scalar(data.get("CAPACITANCE_PROFILE", CAP_PROFILE_LEGACY)))
+
+
+def _profile_keys(data):
+    profile = _profile(data)
+    if profile == CAP_PROFILE_MATRIX9:
+        caps = MATRIX9_KEYS
+    elif profile == CAP_PROFILE_LEGACY:
+        caps = LEGACY_CAP_KEYS
+    else:
+        raise ValueError(f"unsupported capacitance profile '{profile}'")
+
+    required = CORE_DATA_KEYS + caps
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError(f"{profile} data is missing required keys: {', '.join(missing)}")
+    return required + tuple(key for key in OPTIONAL_DATA_KEYS if key in data)
+
+
+def _as_tensor(data, key, expected_shape):
+    arr = np.asarray(data[key], dtype=float)
+    expected_size = int(np.prod(expected_shape))
+    if arr.size != expected_size:
+        raise ValueError(f"{key} has {arr.size} values; expected {expected_size}")
+    return arr.reshape(expected_shape)
+
+
+def _load(path):
+    raw = scipy.io.loadmat(path, simplify_cells=True)
+    keys = [key for key in raw if not key.startswith("_")]
+    if len(keys) != 1:
+        raise ValueError(f"expected exactly one top-level key, found: {keys}")
+    return keys[0], raw[keys[0]]
+
+
+def merge_parts(input_paths, output_path):
+    loaded = []
+    for path in input_paths:
+        key, data = _load(path)
+        loaded.append((path, key, data))
+
+    ref_path, dev_key, ref = loaded[0]
+    tensor_keys = _profile_keys(ref)
+    expected_tail = tuple(len(np.atleast_1d(ref[axis])) for axis in ("VGS", "VDS", "VSB"))
+
+    for path, key, data in loaded:
+        if key != dev_key:
+            raise ValueError(f"{path}: top-level key '{key}' does not match '{dev_key}'")
+        if _profile_keys(data) != tensor_keys:
+            raise ValueError(f"{path}: tensor keys/profile do not match {ref_path}")
+        for axis in ("VGS", "VDS", "VSB"):
+            if not np.allclose(np.atleast_1d(data[axis]), np.atleast_1d(ref[axis])):
+                raise ValueError(f"{path}: {axis} grid does not match {ref_path}")
+        for meta_key in PROFILE_METADATA_KEYS:
+            if _scalar(data.get(meta_key)) != _scalar(ref.get(meta_key)):
+                raise ValueError(f"{path}: metadata '{meta_key}' does not match {ref_path}")
+        n_l = len(np.atleast_1d(data["L"]))
+        expected_shape = (n_l,) + expected_tail
+        for tensor_key in tensor_keys:
+            try:
+                _as_tensor(data, tensor_key, expected_shape)
+            except ValueError as exc:
+                raise ValueError(f"{path}: {exc}") from exc
+
+    loaded.sort(key=lambda item: float(np.min(np.atleast_1d(item[2]["L"]))))
+    merged = dict(ref)
+    merged["L"] = np.concatenate([np.atleast_1d(data["L"]) for _, _, data in loaded])
+    if np.any(np.diff(merged["L"]) <= 0):
+        raise ValueError("merged L coordinates must be strictly increasing and non-overlapping")
+    for key in tensor_keys:
+        arrays = []
+        for _, _, data in loaded:
+            shape = (len(np.atleast_1d(data["L"])),) + expected_tail
+            arrays.append(_as_tensor(data, key, shape))
+        merged[key] = np.concatenate(arrays, axis=0)
+
+    scipy.io.savemat(output_path, {dev_key: merged})
+    return dev_key, merged
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Merge partial L-range .mat files along the L axis.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        description="Merge partial L-range .mat files along the L axis."
     )
-    ap.add_argument("inputs", nargs="+",
-                    help="Partial .mat files in ascending L order")
-    ap.add_argument("--out", required=True,
-                    help="Output merged .mat file path")
+    ap.add_argument("inputs", nargs="+", help="Partial .mat files")
+    ap.add_argument("--out", required=True, help="Output merged .mat file path")
     args = ap.parse_args()
-
     if len(args.inputs) < 2:
         ap.error("Need at least 2 input files to merge.")
 
     print(f"Loading {len(args.inputs)} files...")
-    parts = []
-    for f in args.inputs:
-        try:
-            parts.append(scipy.io.loadmat(f, simplify_cells=True))
-            print(f"  {f}")
-        except Exception as exc:
-            sys.exit(f"Failed to load {f}: {exc}")
-
-    # Determine the device key (top-level .mat key, e.g. 'nfet_03v3')
-    dev_key = [k for k in parts[0] if not k.startswith('_')]
-    if len(dev_key) != 1:
-        sys.exit(f"Expected exactly one top-level key, found: {dev_key}")
-    dev_key = dev_key[0]
-
-    ref = parts[0][dev_key]
-
-    # Validate that VGS, VDS, VSB match across all files
-    for i, p in enumerate(parts[1:], start=1):
-        d = p[dev_key]
-        for axis in ('VGS', 'VDS', 'VSB'):
-            if not np.allclose(np.array(d[axis]), np.array(ref[axis])):
-                sys.exit(f"File {args.inputs[i]}: {axis} grid does not match "
-                         f"{args.inputs[0]}. Cannot merge.")
-
-    # Concatenate L and all data arrays along axis 0
-    merged = dict(ref)
-    merged['L'] = np.concatenate([np.atleast_1d(p[dev_key]['L']) for p in parts])
-    for k in DATA_KEYS:
-        arrays = []
-        for p in parts:
-            arr = np.array(p[dev_key][k])
-            if arr.ndim == 3:          # shape (nVGS, nVDS, nVSB) — single L
-                arr = arr[np.newaxis]  # → (1, nVGS, nVDS, nVSB)
-            arrays.append(arr)
-        merged[k] = np.concatenate(arrays, axis=0)
-
-    scipy.io.savemat(args.out, {dev_key: merged})
-    print(f"\nMerged → {args.out}")
+    for path in args.inputs:
+        print(f"  {path}")
+    try:
+        _, merged = merge_parts(args.inputs, args.out)
+    except Exception as exc:
+        sys.exit(f"Merge failed: {exc}")
+    print(f"\nMerged -> {args.out}")
     print(f"  L     : {merged['L']}")
     print(f"  shape : {merged['ID'].shape}  (nL, nVGS, nVDS, nVSB)")
 
