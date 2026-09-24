@@ -33,8 +33,11 @@
         "CDG": "m0:cdg", "CDD": "m0:cdd", "CDS": "m0:cds",
         "CSG": "m0:csg", "CSD": "m0:csd", "CSS": "m0:css"
       },
-      "spectre_parasitic_signals": {"CJDT": "m0:cjdt", "CJST": "m0:cjst"},
-      "spectre_sat_signals": {"VDSSAT": "m0:vdssat"},
+      "spectre_parasitic_signals": {
+        "CJDT": "m0:cjdt", "CJST": "m0:cjst",
+        "CGDEXT": "m0:cgdext", "CGSEXT": "m0:cgsext", "CGBOV": "m0:cgbov"
+      },
+      "spectre_sat_signals": {"VDSAT": "m0:vdsat", "VDSSAT": "m0:vdssat"},
       "spectre_noise_signals": {"STH": "m0:therm_sid", "SFL": "m0:flicker"}
     },
     {
@@ -70,8 +73,11 @@
         "CDG": "m0:cdg", "CDD": "m0:cdd", "CDS": "m0:cds",
         "CSG": "m0:csg", "CSD": "m0:csd", "CSS": "m0:css"
       },
-      "spectre_parasitic_signals": {"CJDT": "m0:cjdt", "CJST": "m0:cjst"},
-      "spectre_sat_signals": {"VDSSAT": "m0:vdssat"},
+      "spectre_parasitic_signals": {
+        "CJDT": "m0:cjdt", "CJST": "m0:cjst",
+        "CGDEXT": "m0:cgdext", "CGSEXT": "m0:cgsext", "CGBOV": "m0:cgbov"
+      },
+      "spectre_sat_signals": {"VDSAT": "m0:vdsat", "VDSSAT": "m0:vdssat"},
       "spectre_noise_signals": {"STH": "m0:therm_sid", "SFL": "m0:flicker"}
     }
   ]

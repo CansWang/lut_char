@@ -32,8 +32,21 @@ NOISE_REQUIRED = ("STH", "SFL")
 _SCALAR = re.compile(r'^"([^"]+)"\s+([^\s()]+)\s*$')
 _STRUCT_BEGIN = re.compile(r'^"([^"]+)"\s*\(\s*$')
 _TYPE_BEGIN = re.compile(r'^"([^"]+)"\s+STRUCT\s*\(\s*$')
+_TYPE_END_WITH_PROP = re.compile(r'^\)\s+PROP\s*\(\s*$')
 _TRACE = re.compile(r'^"([^"]+)"\s+"?([^"\s()]+)"?')
 _FIELD = re.compile(r'^"([^"]+)"\s+')
+_ANALYSIS_INST = re.compile(
+    r'^"(?P<name>[^"]+)"\s+"analysisInst"\s*\(\s*\n'
+    r'"(?P<analysis>[^"]*)"\s*\n'
+    r'"(?P<data_file>[^"]*)"\s*\n'
+    r'"(?P<format>[^"]*)"\s*\n'
+    r'"(?P<parent>[^"]*)"\s*\n'
+    r'\([^\n]*\)\s*\n'
+    r'"(?P<description>[^"]*)"\s*\n'
+    r'\)\s*PROP\s*\(\s*\n(?P<properties>.*?)^\)\s*$',
+    re.MULTILINE | re.DOTALL,
+)
+_OUTER_VALUE = re.compile(r'^"ds"\s+([^\s()]+)\s*$', re.MULTILINE)
 
 
 class SpectreDataError(ValueError):
@@ -64,6 +77,14 @@ def read_psfascii(path: Path) -> dict[str, np.ndarray]:
                 continue
             if section == "TYPE":
                 if current_type is not None:
+                    # Spectre 25.1 writes `) PROP(` when a STRUCT definition
+                    # is followed by type metadata.  The close parenthesis
+                    # ends the STRUCT even though the line's net paren count
+                    # is zero; key/master below it are not STRUCT fields.
+                    if type_depth == 1 and _TYPE_END_WITH_PROP.match(line):
+                        current_type = None
+                        type_depth = 0
+                        continue
                     if type_depth == 1:
                         match = _FIELD.match(line)
                         if match:
@@ -131,12 +152,87 @@ def _signal(traces: dict[str, np.ndarray], spec, count: int, label: str) -> np.n
     raise SpectreDataError(f"{label}: none of {names!r} found; available: {list(traces)}")
 
 
-def _dataset(raw_dir: Path, outer: str, inner: str) -> Path:
-    target = f"{outer}_{inner}-sweep"
-    matches = [p for p in raw_dir.rglob(target) if p.is_file()]
-    if len(matches) != 1:
-        raise SpectreDataError(f"{raw_dir}: expected one {target}, found {len(matches)}")
-    return matches[0]
+def _analysis_leaves(raw_dir: Path, parent: str) -> list[tuple[float, Path]]:
+    """Return physical PSF leaves for a logical nested-sweep parent."""
+    log_path = raw_dir / "logFile"
+    if not log_path.is_file():
+        raise SpectreDataError(f"{raw_dir}: missing PSF logFile")
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    leaves = []
+    available_parents = set()
+    for match in _ANALYSIS_INST.finditer(text):
+        record_parent = match.group("parent")
+        if record_parent:
+            available_parents.add(record_parent)
+        if record_parent != parent:
+            continue
+        if match.group("format").upper() != "PSF":
+            raise SpectreDataError(
+                f"{log_path}: {match.group('name')} uses unsupported format "
+                f"{match.group('format')!r}")
+        outer_match = _OUTER_VALUE.search(match.group("properties"))
+        if outer_match is None:
+            raise SpectreDataError(
+                f"{log_path}: {match.group('name')} has no numeric ds property")
+        try:
+            outer_value = float(outer_match.group(1))
+        except ValueError as exc:
+            raise SpectreDataError(
+                f"{log_path}: invalid ds value {outer_match.group(1)!r}") from exc
+        relative_path = Path(match.group("data_file"))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise SpectreDataError(
+                f"{log_path}: unsafe PSF leaf path {str(relative_path)!r}")
+        data_path = raw_dir / relative_path
+        if not data_path.is_file():
+            raise SpectreDataError(f"{log_path}: missing PSF leaf {data_path.name}")
+        leaves.append((outer_value, data_path))
+    if not leaves:
+        raise SpectreDataError(
+            f"{raw_dir}: no leaves for {parent}; available parents: "
+            f"{sorted(available_parents)}")
+    leaves.sort(key=lambda item: item[0])
+    outer_values = np.asarray([value for value, _ in leaves])
+    if not np.all(np.isfinite(outer_values)) or np.any(np.diff(outer_values) <= 0):
+        raise SpectreDataError(f"{log_path}: {parent} ds values are not unique and increasing")
+    return leaves
+
+
+def read_psf_family(raw_dir: Path, parent: str, outer_values,
+                    inner_values) -> dict[str, np.ndarray]:
+    """Read and concatenate nested-sweep leaves in outer-sweep order."""
+    expected_outer = np.asarray(outer_values, dtype=float)
+    expected_inner = np.asarray(inner_values, dtype=float)
+    leaves = _analysis_leaves(raw_dir, parent)
+    measured_outer = np.asarray([value for value, _ in leaves])
+    if (measured_outer.shape != expected_outer.shape or
+            not np.allclose(measured_outer, expected_outer, rtol=1e-7, atol=1e-9)):
+        raise SpectreDataError(
+            f"{raw_dir}: {parent} ds grid differs from requested VDS grid")
+
+    chunks: dict[str, list[np.ndarray]] = defaultdict(list)
+    expected_keys = None
+    for outer_value, path in leaves:
+        traces = read_psfascii(path)
+        keys = set(traces)
+        if expected_keys is None:
+            expected_keys = keys
+        elif keys != expected_keys:
+            missing = sorted(expected_keys - keys)
+            extra = sorted(keys - expected_keys)
+            raise SpectreDataError(
+                f"{path}: trace schema differs; missing={missing}, extra={extra}")
+        gs = _signal(traces, ("gs", "/gs"), len(expected_inner), f"{path.name} gs")
+        if not np.allclose(gs, expected_inner, rtol=1e-7, atol=1e-9):
+            raise SpectreDataError(
+                f"{path}: gs grid differs from requested VGS grid at ds={outer_value}")
+        for name, values in traces.items():
+            if values.size != len(expected_inner):
+                raise SpectreDataError(
+                    f"{path}: {name} has {values.size} points, "
+                    f"expected {len(expected_inner)}")
+            chunks[name].append(values)
+    return {name: np.concatenate(values) for name, values in chunks.items()}
 
 
 def _model_lines(cfg, corner: str) -> list[str]:
@@ -264,6 +360,17 @@ def _existing_valid(path: Path, axes: dict[str, np.ndarray], required: set[str],
                and np.all(np.isfinite(data[name])) for name in required)
 
 
+def _spectre_log_succeeded(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    with path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(max(0, size - 65536))
+        tail = stream.read().decode("utf-8", errors="replace")
+    return re.search(r"spectre completes with 0 errors", tail, re.IGNORECASE) is not None
+
+
 def run_spectre_job(cfg, corner: str, temp: int, l_vec, vsb_vec, vgs_vec,
                     vds_vec, sim_dir: Path, mat_path: Path) -> str:
     if shutil.which("spectre") is None:
@@ -319,16 +426,27 @@ def run_spectre_job(cfg, corner: str, temp: int, l_vec, vsb_vec, vgs_vec,
                 netlist = chunk_dir / "techsweep.scs"
                 content = make_netlist(cfg, corner, temp, length, abs(vsb),
                                        np.asarray(vgs_vec), np.asarray(vds_vec), raw_dir)
-                netlist.write_text(content)
+                try:
+                    netlist_matches = netlist.read_text() == content
+                except OSError:
+                    netlist_matches = False
+                if not netlist_matches:
+                    netlist.write_text(content)
                 digest = hashlib.sha256(content.encode()).hexdigest()
                 marker = chunk_dir / "complete.json"
                 cached = False
-                if marker.exists():
+                raw_complete = (raw_dir / "logFile").is_file()
+                if marker.exists() and raw_complete:
                     try:
                         cached = json.loads(marker.read_text()).get("netlist_sha256") == digest
                     except (OSError, ValueError):
                         pass
                 log_path = chunk_dir / "techsweep.log"
+                if (not cached and netlist_matches and raw_complete and
+                        _spectre_log_succeeded(log_path)):
+                    cached = True
+                    marker.write_text(json.dumps({"netlist_sha256": digest}) + "\n")
+                    print(f"  [reuse] completed Spectre raw data: {raw_dir}")
                 if not cached:
                     marker.unlink(missing_ok=True)
                     if raw_dir.exists():
@@ -344,8 +462,13 @@ def run_spectre_job(cfg, corner: str, temp: int, l_vec, vsb_vec, vgs_vec,
                         raise RuntimeError(
                             f"Spectre failed ({result.returncode}); see {log_path}\n"
                             f"Last 30 log lines:\n{log_tail}")
-                dc = read_psfascii(_dataset(raw_dir, "sweepvds", "sweepvgs"))
-                noise = read_psfascii(_dataset(raw_dir, "sweepvds_noise", "sweepvgs_noise"))
+                    # This marks simulator completion.  Keep it even if a later
+                    # parser error occurs so retries do not rerun Spectre.
+                    marker.write_text(json.dumps({"netlist_sha256": digest}) + "\n")
+                dc = read_psf_family(raw_dir, "sweepvds_sweepvgs-sweep",
+                                     vds_vec, vgs_vec)
+                noise = read_psf_family(raw_dir, "sweepvds_noise_sweepvgs_noise-sweep",
+                                        vds_vec, vgs_vec)
                 _validate_bias_traces(cfg, dc, np.asarray(vgs_vec), np.asarray(vds_vec), abs(vsb))
                 data = _normalize_dc(cfg, dc, count, n_vgs, n_vds)
                 if "freq" in noise and (noise["freq"].size != count or
@@ -359,7 +482,6 @@ def run_spectre_job(cfg, corner: str, temp: int, l_vec, vsb_vec, vgs_vec,
                     if key not in data:
                         raise SpectreDataError(f"{cfg.key}: missing output tensor {key}")
                     arrays[key][li, :, :, bi] = data[key]
-                marker.write_text(json.dumps({"netlist_sha256": digest}) + "\n")
 
         sign = "p" if temp >= 0 else "m"
         mat_key = f"{cfg.device.replace('-', '_')}_{corner}_T{sign}{abs(temp)}"

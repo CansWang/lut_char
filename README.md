@@ -93,10 +93,10 @@ device JSON. It requires `--cap-matrix --uniform-grid` and uses standalone
 Spectre PSF ASCII output; MATLAB and Ocean are not required. The backend runs
 one nested VDS/VGS DC sweep and a separate 1 Hz noise sweep per
 `(device, corner, temperature, L, VSB)` slice. It saves the signed total
-Matrix9, DC fields, native `VDSSAT`, required `STH`/`SFL`, and native
-`CJDT`/`CJST`; additional native parasitic and saturation fields can be mapped
-in the device JSON. A partial or unreadable sweep fails the job. Completed
-slices are cached under `sim/` for restart.
+Matrix9, DC fields, native `VDSAT`/`VDSSAT`, required `STH`/`SFL`, native
+`CJDT`/`CJST`, and mapped external capacitance components. A partial or
+unreadable sweep fails the job. Simulator completion is cached before parsing,
+so parser retries reuse successful raw data under `sim/`.
 
 The [public example config](examples/tsmc16_spectre.example.json) follows the
 LVT NFET/PFET geometry and model names in the cited MATLAB starter file. Copy
@@ -120,6 +120,15 @@ export TSMC16_MODEL_TOP=/protected/pdk/toplevel.scs
 export TSMC16_MODEL_USAGE=/protected/pdk/usage.scs
 export TSMC16_CFG=/protected/tsmc16_spectre.json
 export LUT_RUN_ROOT=/protected/tsmc16_luts
+```
+
+The equivalent setup in `tcsh` is:
+
+```tcsh
+setenv TSMC16_MODEL_TOP /protected/pdk/toplevel.scs
+setenv TSMC16_MODEL_USAGE /protected/pdk/usage.scs
+setenv TSMC16_CFG /protected/tsmc16_spectre.json
+setenv LUT_RUN_ROOT /protected/tsmc16_luts
 ```
 
 Copy the example JSON to `TSMC16_CFG` and edit it for the remote deck. Once the
@@ -175,16 +184,11 @@ when that check shows the junction branch is absent. This prevents counting
 `CJDT`/`CJST` twice. If the deck lacks any required field, stop and correct
 the signal map or scope before the dense run.
 
-The example maps native `VDSSAT`, which the public starter does not save. If
-the remote deck also exposes a distinct native `vdsat`, add
-`"VDSAT": "m0:vdsat"` to each device's `spectre_sat_signals` before the smoke
-run; the saved MAT and NetCDF files will then contain both. Do not map VDSAT
-to VDSSAT as an alias. `CJDT`, `CJST`, and `CGE` are saved separately from the
-normalized Matrix9. Additional native parasitic fields can be added to
-`spectre_parasitic_signals` after confirming their exact Spectre names in the
-remote operating-point output. The current NetCDF exporter also carries
-`CGDEXT`, `CGSEXT`, `CGBOV`, and `CFGEO` when mapped; other custom fields
-remain in the per-PVT MAT files until added to the export key list.
+The example maps distinct native `VDSAT` and `VDSSAT`; neither is used as an
+alias for the other. `CJDT`, `CJST`, `CGDEXT`, `CGSEXT`, `CGBOV`, and `CGE`
+are saved separately from the normalized Matrix9. The NetCDF exporter carries
+these fields, plus `CFGEO` when mapped. Other custom fields remain in the
+per-PVT MAT files until added to the export key list.
 
 The first remote smoke is the acceptance test for the site's Spectre PSF ASCII
 layout and device operating-point names. The backend checks trace counts,
