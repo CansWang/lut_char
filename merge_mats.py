@@ -11,16 +11,22 @@ from capacitance import CAP_PROFILE_LEGACY, CAP_PROFILE_MATRIX9, LEGACY_CAP_KEYS
 
 
 CORE_DATA_KEYS = ("ID", "VT", "GM", "GMB", "GDS")
-OPTIONAL_DATA_KEYS = ("STH", "SFL", "VDSAT")
+OPTIONAL_DATA_KEYS = (
+    "STH", "SFL", "VDSAT", "VDSSAT", "IGD", "IGS", "CGE",
+    "CJDT", "CJST", "CGDEXT", "CGSEXT", "CGBOV", "CFGEO",
+)
 DATA_KEYS = list(CORE_DATA_KEYS + LEGACY_CAP_KEYS + OPTIONAL_DATA_KEYS)
 PROFILE_METADATA_KEYS = (
     "CAPACITANCE_PROFILE", "CAPACITANCE_SCHEMA_VERSION",
     "CAPACITANCE_CONVENTION", "CAPACITANCE_TERMINALS",
     "CAPACITANCE_COMPONENTS", "MODEL_FAMILY", "BULK_TERMINAL_ALIAS",
+    "CAPACITANCE_JUNCTION_MODE", "NOISE_FREQ_HZ", "SIMULATOR",
 )
 
 
 def _scalar(value):
+    if value is None:
+        return None
     arr = np.asarray(value)
     return arr.flat[0].item() if arr.size else None
 

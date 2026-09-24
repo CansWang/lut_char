@@ -4,7 +4,7 @@ from scipy.io import savemat
 
 from capacitance import LEGACY_CAP_KEYS, MATRIX9_KEYS, capacitance_metadata
 from merge_mats import merge_parts
-from merge_to_nc import build_dataset, collect_files
+from merge_to_nc import build_dataset, collect_files, export_group_streaming
 
 
 CORE = ("ID", "VT", "GM", "GMB", "GDS")
@@ -79,3 +79,26 @@ def test_build_dataset_restores_matlab_squeezed_singleton_axes(tmp_path):
     groups = collect_files(tmp_path)
     ds = build_dataset(groups["demo_vsb1_cm9"], "demo_vsb1_cm9")
     assert ds["CDG"].shape == (1, 1, 2, 2, 2, 1)
+
+
+def test_streaming_export_keeps_custom_corner_and_spectre_fields(tmp_path):
+    extra = capacitance_metadata("bsimcmg", bulk_alias="E")
+    extra.update({"VDSSAT": np.full((2, 2, 2, 2), 0.12),
+                  "CJDT": np.full((2, 2, 2, 2), 1e-16),
+                  "CJST": np.full((2, 2, 2, 2), 2e-16),
+                  "CAPACITANCE_JUNCTION_MODE": "native_total",
+                  "NOISE_FREQ_HZ": 1.0, "SIMULATOR": "spectre"})
+    for temp in (27, 125):
+        _write_mat(tmp_path / f"demo_NOM_Tp{temp}_vsb2_cm9.mat",
+                   [0.016, 0.02], MATRIX9_KEYS, extra, corner="NOM", temp=temp)
+    group = collect_files(tmp_path)["demo_vsb2_cm9"]
+    out = tmp_path / "demo.nc"
+    export_group_streaming(group, "demo", out, ["NOM"], [27, 125])
+    import xarray as xr
+    with xr.open_dataset(out) as ds:
+        assert ds.corner.values.tolist() == ["NOM"]
+        assert ds.VDSSAT.shape == (1, 2, 2, 2, 2, 2)
+        assert float(ds.CJDT.isel(corner=0, temp=0, L=0, VGS=0, VDS=0, VSB=0)) == 1e-16
+    with pytest.raises(ValueError, match="temperature set"):
+        export_group_streaming(group, "demo", tmp_path / "bad.nc", ["NOM"], [27, 85, 125])
+    assert not (tmp_path / "bad.nc").exists()

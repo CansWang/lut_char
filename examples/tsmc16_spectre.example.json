@@ -1,0 +1,78 @@
+{
+  "devices": [
+    {
+      "key": "tsmc16:nch_lvt",
+      "device": "nch_lvt_mac",
+      "pdk": "tsmc16",
+      "fet_type": "nfet",
+      "simulator": "spectre",
+      "model_family": "bsim-cmg",
+      "bulk_terminal_alias": "E",
+      "model_lib": "$TSMC16_MODEL_TOP",
+      "lib_corner_map": {"TT": "top_tt", "FF": "top_ff", "SS": "top_ss", "SF": "top_sf", "FS": "top_fs"},
+      "model_setup_lines": [
+        "include \"{MODEL_LIB}\" section={LIB_CORNER}",
+        "include \"$TSMC16_MODEL_USAGE\" section=pre_simu"
+      ],
+      "instance_template": "m0 ({D} {G} {S} {B}) {DEVICE} l={LX}u nfin={NFING} nf={NF}",
+      "save_pfx": "",
+      "l_vec": [0.016, 0.02, 0.036, 0.072],
+      "nfing": 4,
+      "nf": 4,
+      "w_um": 0.616,
+      "vdd": 1.0,
+      "vgs_max": 1.0,
+      "vds_max": 1.0,
+      "vsb_vec": [0.0],
+      "spectre_instance": "m0",
+      "spectre_cap_junction_mode": "native_total",
+      "spectre_dc_signals": {
+        "ID": "m0:ids", "VT": "m0:vth", "GM": "m0:gm", "GMB": "m0:gmbs", "GDS": "m0:gds",
+        "IGD": "m0:igd", "IGS": "m0:igs", "CGE": "m0:cge",
+        "CGG": "m0:cgg", "CGD": "m0:cgd", "CGS": "m0:cgs",
+        "CDG": "m0:cdg", "CDD": "m0:cdd", "CDS": "m0:cds",
+        "CSG": "m0:csg", "CSD": "m0:csd", "CSS": "m0:css"
+      },
+      "spectre_parasitic_signals": {"CJDT": "m0:cjdt", "CJST": "m0:cjst"},
+      "spectre_sat_signals": {"VDSSAT": "m0:vdssat"},
+      "spectre_noise_signals": {"STH": "m0:therm_sid", "SFL": "m0:flicker"}
+    },
+    {
+      "key": "tsmc16:pch_lvt",
+      "device": "pch_lvt_mac",
+      "pdk": "tsmc16",
+      "fet_type": "pfet",
+      "simulator": "spectre",
+      "model_family": "bsim-cmg",
+      "bulk_terminal_alias": "E",
+      "model_lib": "$TSMC16_MODEL_TOP",
+      "lib_corner_map": {"TT": "top_tt", "FF": "top_ff", "SS": "top_ss", "SF": "top_sf", "FS": "top_fs"},
+      "model_setup_lines": [
+        "include \"{MODEL_LIB}\" section={LIB_CORNER}",
+        "include \"$TSMC16_MODEL_USAGE\" section=pre_simu"
+      ],
+      "instance_template": "m0 ({D} {G} {S} {B}) {DEVICE} l={LX}u nfin={NFING} nf={NF}",
+      "save_pfx": "",
+      "l_vec": [0.016, 0.02, 0.036, 0.072],
+      "nfing": 4,
+      "nf": 4,
+      "w_um": 0.616,
+      "vdd": 1.0,
+      "vgs_max": 1.0,
+      "vds_max": 1.0,
+      "vsb_vec": [0.0],
+      "spectre_instance": "m0",
+      "spectre_cap_junction_mode": "native_total",
+      "spectre_dc_signals": {
+        "ID": "m0:ids", "VT": "m0:vth", "GM": "m0:gm", "GMB": "m0:gmbs", "GDS": "m0:gds",
+        "IGD": "m0:igd", "IGS": "m0:igs", "CGE": "m0:cge",
+        "CGG": "m0:cgg", "CGD": "m0:cgd", "CGS": "m0:cgs",
+        "CDG": "m0:cdg", "CDD": "m0:cdd", "CDS": "m0:cds",
+        "CSG": "m0:csg", "CSD": "m0:csd", "CSS": "m0:css"
+      },
+      "spectre_parasitic_signals": {"CJDT": "m0:cjdt", "CJST": "m0:cjst"},
+      "spectre_sat_signals": {"VDSSAT": "m0:vdssat"},
+      "spectre_noise_signals": {"STH": "m0:therm_sid", "SFL": "m0:flicker"}
+    }
+  ]
+}

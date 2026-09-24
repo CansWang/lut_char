@@ -76,9 +76,10 @@ from capacitance import (
 
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-SIM_DIR   = Path("/home/canswang/lut_char/sim")
-OUT_DIR   = Path("/home/canswang/lut_char/output")
-STOP_FILE = Path("/home/canswang/lut_char/STOP")
+_PROJECT_DIR = Path(__file__).resolve().parent
+SIM_DIR   = _PROJECT_DIR / "sim"
+OUT_DIR   = _PROJECT_DIR / "output"
+STOP_FILE = _PROJECT_DIR / "STOP"
 
 _SPICEINIT_SRC = Path(
     "/home/canswang/IHP-Open-PDK/ihp-sg13g2/libs.tech/ngspice/.spiceinit"
@@ -248,6 +249,16 @@ class DevCfg:
     simulation_env: dict = field(default_factory=dict)
     output_aliases: dict = field(default_factory=dict)
     bulk_terminal_alias: str = "B"
+    simulator: str = "ngspice"
+    nf: int = 1
+    vdd: Optional[float] = None
+    spectre_instance: str = "m0"
+    spectre_dc_signals: dict = field(default_factory=dict)
+    spectre_noise_signals: dict = field(default_factory=dict)
+    spectre_parasitic_signals: dict = field(default_factory=dict)
+    spectre_sat_signals: dict = field(default_factory=dict)
+    spectre_cap_junction_mode: str = "native_total"
+    spectre_timeout_s: int = 86400
 
 
 # ── Model library paths ────────────────────────────────────────────────────────
@@ -520,6 +531,36 @@ def load_device_configs(paths, registry=None):
                 raise ValueError(f"{where}: fet_type must be 'nfet' or 'pfet'")
             if not cfg.lib_corner_map:
                 raise ValueError(f"{where}: lib_corner_map cannot be empty")
+            if cfg.simulator not in {"ngspice", "spectre"}:
+                raise ValueError(f"{where}: unsupported simulator '{cfg.simulator}'")
+            if cfg.simulator == "spectre":
+                if not cfg.model_setup_lines:
+                    raise ValueError(f"{where}: Spectre requires model_setup_lines")
+                if not cfg.instance_template:
+                    raise ValueError(f"{where}: Spectre requires instance_template")
+                if cfg.caps_model != "bsimcmg":
+                    raise ValueError(f"{where}: Spectre currently requires BSIM-CMG")
+                if not cfg.spectre_dc_signals or not cfg.spectre_noise_signals:
+                    raise ValueError(f"{where}: Spectre requires DC and noise signal maps")
+                if not cfg.spectre_instance:
+                    raise ValueError(f"{where}: spectre_instance must name the saved device")
+                for map_name in ("spectre_dc_signals", "spectre_noise_signals",
+                                 "spectre_parasitic_signals", "spectre_sat_signals"):
+                    signal_map = getattr(cfg, map_name)
+                    if not isinstance(signal_map, dict):
+                        raise ValueError(f"{where}: {map_name} must be an object")
+                    for field_name, signal in signal_map.items():
+                        candidates = [signal] if isinstance(signal, str) else signal
+                        if (not isinstance(candidates, list) or not candidates or
+                                not all(isinstance(name, str) and name for name in candidates)):
+                            raise ValueError(f"{where}: {map_name}.{field_name} must be "
+                                             "a signal name or nonempty list of names")
+                if cfg.vdd is None or cfg.vdd <= 0:
+                    raise ValueError(f"{where}: Spectre requires positive vdd")
+                if cfg.spectre_cap_junction_mode not in {"native_total", "add_junction"}:
+                    raise ValueError(f"{where}: invalid spectre_cap_junction_mode")
+                if cfg.spectre_timeout_s <= 0:
+                    raise ValueError(f"{where}: spectre_timeout_s must be positive")
             result[cfg.key] = cfg
     return result
 
@@ -543,13 +584,14 @@ def _instance_line(cfg: DevCfg) -> str:
             "D": "d", "G": "g", "S": "0", "B": "b",
             "DEVICE": cfg.device, "LX": "{lx}", "W_UM": cfg.w_um,
             "NFING": cfg.nfing,
+            "NF": cfg.nf,
         }
         try:
             return cfg.instance_template.format_map(values)
         except KeyError as exc:
             raise ValueError(
                 f"{cfg.key}: unsupported instance_template placeholder {exc}; "
-                "supported placeholders are D, G, S, B, DEVICE, LX, W_UM, NFING"
+                "supported placeholders are D, G, S, B, DEVICE, LX, W_UM, NFING, NF"
             ) from exc
 
     u = "u" if cfg.has_explicit_u else ""
@@ -1257,7 +1299,7 @@ def _run_one_pvt(args):
 
     sign     = 'p' if temp >= 0 else 'm'
     tag      = f"{corner}_T{sign}{abs(temp)}"
-    dev_safe = cfg.device.replace(':', '_')
+    dev_safe = cfg.device.replace(':', '_').replace('/', '_')
     label    = f"{cfg.device}/{corner}/T{sign}{abs(temp)}"
 
     # Append L-range suffix when only a subset of L values is being simulated,
@@ -1279,9 +1321,6 @@ def _run_one_pvt(args):
     mat_path     = str(out_dir / f"{dev_safe}_{tag}{grid_suffix}{profile_suffix}{l_suffix}.mat")
 
     _p = Path(mat_path)
-    if _p.exists() and _p.stat().st_size > 0:
-        print(f"  [skip] {corner}/T{sign}{abs(temp)} — output exists: {mat_path}")
-        return (corner, temp, mat_path)
 
     # VGS/VDS vectors for parse_and_save tensor reshape
     if vgs_override is not None:
@@ -1293,6 +1332,20 @@ def _run_one_pvt(args):
 
     vds_all = (build_uniform_vds(cfg.vds_max, vds_step) if uniform_grid
                else build_vds_all(cfg.vds_max))
+
+    if cfg.simulator == "spectre":
+        if not uniform_grid:
+            raise ValueError(f"{cfg.key}: Spectre backend requires --uniform-grid")
+        if not cap_matrix:
+            raise ValueError(f"{cfg.key}: Spectre backend requires --cap-matrix")
+        from spectre_backend import run_spectre_job
+        path = run_spectre_job(cfg, corner, temp, l_vec, vsb_vec, parse_vgs,
+                               vds_all, sim_dir, _p)
+        return (corner, temp, path)
+
+    if _p.exists() and _p.stat().st_size > 0:
+        print(f"  [skip] {corner}/T{sign}{abs(temp)} — output exists: {mat_path}")
+        return (corner, temp, mat_path)
 
     n_sim = len(l_vec) * len(parse_vgs) * len(vds_all) * len(vsb_vec)
     print(f"\n{'='*68}")
@@ -1379,7 +1432,8 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
                        distribute L-range work across machines; use merge_mats.py to
                        combine the resulting partial .mat files afterward.
     test_mode        : run a micro-sweep (2L × 2VGS × 1VSB, TT/27°C) for validation.
-    smoke_mode       : ultra-fast smoke test (1L × 1VGS × fullVDS × 1VSB, TT/27°C).
+    smoke_mode       : small smoke test (1L × 1VGS × fullVDS × all selected VSB,
+                       corners, and temperatures).
     corners_per_batch: number of corners to run in each sequential batch.
     uniform_grid     : use uniform grids for both VGS and VDS (steps below).
     vgs_step/vds_step: uniform VGS/VDS step in volts (default 25 mV). Only used
@@ -1401,8 +1455,8 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
     if cfg.spiceinit_src is not None:
         setup_spiceinit(cfg, sim_dir)
 
-    validation_corner = "TT" if "TT" in cfg.lib_corner_map else corners[0]
-    if cap_matrix:
+    validation_corner = "TT" if "TT" in corners else corners[0]
+    if cap_matrix and cfg.simulator == "ngspice":
         probe_corner = validation_corner if test_mode or smoke_mode else corners[0]
         probe_temp = 27 if test_mode or smoke_mode else (temps[0] if temps else 27)
         probe_capacitance_outputs(cfg, probe_corner, probe_temp, sim_dir)
@@ -1440,14 +1494,16 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
     # Build batch list
     if test_mode:
         l_t, vgs_t, vsb_t = _test_grids(cfg)
-        batches = [("test", [(cfg, validation_corner, 27, l_t, vsb_t, vgs_t, True, False,
+        batches = [("test", [(cfg, validation_corner, 27, l_t, vsb_t, vgs_t, True, uniform_grid,
                               vgs_step, vds_step, base_sim_dir, base_out_dir,
                               cap_matrix)])]
     elif smoke_mode:
         l_s, vgs_s, vsb_s = _smoke_grids(cfg)
-        batches = [("smoke", [(cfg, validation_corner, 27, l_s, vsb_s, vgs_s, False, False,
-                               vgs_step, vds_step, base_sim_dir, base_out_dir,
-                               cap_matrix)])]
+        batches = [("smoke", [
+            (cfg, corner, temp, l_s, vsb_s, vgs_s, False, uniform_grid,
+             vgs_step, vds_step, base_sim_dir, base_out_dir, cap_matrix)
+            for corner in corners for temp in temps
+        ])]
     else:
         corner_batches = [corners[i:i+corners_per_batch]
                           for i in range(0, len(corners), corners_per_batch)]
@@ -1464,8 +1520,7 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
     n_batches = len(batches)
     for batch_idx, (batch_label, jobs) in enumerate(batches):
         if STOP_FILE.exists():
-            print("\n  [STOP] STOP file detected — aborting remaining batches")
-            break
+            raise RuntimeError("STOP file detected before all PVT batches completed")
 
         if not test_mode and not smoke_mode:
             print(f"\n  Batch {batch_idx+1}/{n_batches}: corners={list(batch_label)}")
@@ -1473,9 +1528,12 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
         cap       = max_workers if max_workers is not None else N_WORKERS_DEFAULT
         n_workers = min(len(jobs), cap)
 
+        failed = []
         if n_workers <= 1:
             for job in jobs:
-                _run_one_pvt(job)
+                result = _run_one_pvt(job)
+                if result is None:
+                    failed.append((job[1], job[2]))
         else:
             with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
                 future_to_job = {pool.submit(_run_one_pvt, job): job for job in jobs}
@@ -1490,8 +1548,12 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
                             print(f"\n  [done] {c}/T{sign}{abs(t)} → {mat_path}")
                         else:
                             print(f"\n  [FAIL] {corner}/T{sign}{abs(temp)} — see log in {sim_dir}")
+                            failed.append((corner, temp))
                     except Exception as exc:
                         print(f"\n  [EXC ] {corner}/T{sign}{abs(temp)} raised: {exc}")
+                        failed.append((corner, temp))
+        if failed:
+            raise RuntimeError(f"{cfg.key}: {len(failed)} PVT job(s) failed: {failed}")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -1533,11 +1595,11 @@ def main():
     ap.add_argument("--test-run", action="store_true",
                     help="Micro-sweep validation (2 L, 2 VGS, 1 VSB, TT/27°C)")
     ap.add_argument("--smoke", action="store_true",
-                    help="Ultra-fast smoke test: 1L × 1VGS × fullVDS × 1VSB, TT/27°C. "
-                         "Verifies the pipeline runs end-to-end; no validation output.")
+                    help="Small smoke test: 1L × 1VGS × fullVDS × all selected VSB. "
+                         "Defaults to TT/27°C; --corners and --temps extend the PVT gate.")
     ap.add_argument("--corners", nargs="+", metavar="CORNER",
                     help="Override corners (default: all available for device)")
-    ap.add_argument("--temps", nargs="+", type=int, default=ALL_TEMPS,
+    ap.add_argument("--temps", nargs="+", type=int, default=None,
                     metavar="TEMP",
                     help="Temperatures in °C (default: -40 27 125)")
     ap.add_argument("--l-range", metavar="START:STOP",
@@ -1575,12 +1637,19 @@ def main():
                          f"(default: {SIM_DIR}).")
     args = ap.parse_args()
 
+    if args.uniform_grid and (args.vgs_step <= 0 or args.vds_step <= 0):
+        ap.error("--vgs-step and --vds-step must be positive")
+    if args.workers is not None and args.workers < 1:
+        ap.error("--workers must be >= 1")
+    if args.test_run and args.smoke:
+        ap.error("--test-run and --smoke are mutually exclusive")
+
     try:
         devices = load_device_configs(args.device_config)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         ap.error(f"invalid --device-config: {exc}")
 
-    if STOP_FILE.exists():
+    if not args.list and STOP_FILE.exists():
         print(f"  [WARN] Removing stale STOP file from previous run: {STOP_FILE}")
         STOP_FILE.unlink()
 
@@ -1636,11 +1705,14 @@ def main():
 
         cfg = devices[dev_key]
 
+        if cfg.simulator == "spectre" and (not args.uniform_grid or not args.cap_matrix):
+            ap.error(f"{dev_key}: Spectre requires --uniform-grid and --cap-matrix")
+
         if args.vsb_points is not None:
             if args.vsb_points < 1:
                 ap.error("--vsb-points must be >= 1")
             vsb_new = [round(v, 4)
-                       for v in np.linspace(0.0, -cfg.vgs_max, args.vsb_points).tolist()]
+                       for v in np.linspace(0.0, -(cfg.vdd or cfg.vgs_max), args.vsb_points).tolist()]
             cfg = replace(cfg, vsb_vec=vsb_new)
 
         if n_devices > 1:
@@ -1651,6 +1723,9 @@ def main():
         # Determine corners
         if args.corners:
             available = set(cfg.lib_corner_map.keys())
+            unavailable = set(args.corners) - available
+            if cfg.simulator == "spectre" and unavailable:
+                ap.error(f"{dev_key}: unknown corners {sorted(unavailable)}")
             corners = [c for c in args.corners if c in available]
             if not corners:
                 print(f"  [SKIP] {dev_key}: no overlap between requested corners "
@@ -1658,6 +1733,9 @@ def main():
                 continue
         else:
             corners = list(cfg.lib_corner_map.keys())
+        if args.smoke and not args.corners:
+            corners = ["TT"] if "TT" in corners else corners[:1]
+        temps = args.temps if args.temps is not None else ([27] if args.smoke else ALL_TEMPS)
 
         # Determine L vector (full or sliced via --l-range)
         l_vec = list(cfg.l_vec)
@@ -1678,7 +1756,7 @@ def main():
             else:
                 vgs_all = build_vgs_all(cfg.vgs_max)
                 vds_all = build_vds_all(cfg.vds_max)
-            n_pvt   = len(corners) * len(args.temps)
+            n_pvt   = len(corners) * len(temps)
             n_sim   = len(l_vec) * len(vgs_all) * len(vds_all) * len(cfg.vsb_vec)
             l_info  = (f"{l_vec[0]}–{l_vec[-1]}µm ({len(l_vec)} pts"
                        + (f", partial {len(l_vec)}/{len(cfg.l_vec)})" if args.l_range else ")"))
@@ -1694,12 +1772,18 @@ def main():
                       f"{_n_vds_coarse(cfg.vds_max)} coarse = {len(vds_all)} pts")
             print(f"VSB: {len(cfg.vsb_vec)} pts  {cfg.vsb_vec}")
             print(f"Capacitance: {'Matrix9 (_cm9)' if args.cap_matrix else 'legacy'}")
-            print(f"Corners: {corners}  Temps: {args.temps}  PVT jobs: {n_pvt}")
+            print(f"Corners: {corners}  Temps: {temps}  PVT jobs: {n_pvt}")
             cap = args.workers if args.workers is not None else N_WORKERS_DEFAULT
             print(f"Simulations per job: {n_sim:,}  "
                   f"Workers: {min(n_pvt, cap)}/{os.cpu_count()} CPUs")
 
-        run_pvt(cfg, corners, args.temps, l_vec=l_vec,
+        sim_root = Path(args.sim_dir).resolve() if args.sim_dir else SIM_DIR
+        out_root = Path(args.output_dir).resolve() if args.output_dir else OUT_DIR
+        if args.smoke or args.test_run:
+            tag = "smoke" if args.smoke else "test"
+            sim_root = sim_root / tag
+            out_root = out_root / tag
+        run_pvt(cfg, corners, temps, l_vec=l_vec,
                 test_mode=args.test_run,
                 smoke_mode=args.smoke,
                 max_workers=args.workers,
@@ -1707,8 +1791,8 @@ def main():
                 uniform_grid=args.uniform_grid,
                 vgs_step=args.vgs_step,
                 vds_step=args.vds_step,
-                base_sim_dir=Path(args.sim_dir) if args.sim_dir else None,
-                base_out_dir=Path(args.output_dir) if args.output_dir else None,
+                base_sim_dir=sim_root,
+                base_out_dir=out_root,
                 cap_matrix=args.cap_matrix)
 
 

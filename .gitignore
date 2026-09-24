@@ -22,6 +22,10 @@ __pycache__/
 *.nglog
 *.raw
 
+# Spectre run artifacts
+*.psf
+techsweep.scs
+
 # Editor / OS
 .DS_Store
 *.swp

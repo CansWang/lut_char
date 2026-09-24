@@ -34,7 +34,7 @@ Two grid modes are supported:
 
 - **ngspice** ≥ 41 (with BSIM4 noise support)
 - **Python** ≥ 3.9
-- Python packages: `numpy`, `scipy`
+- Python packages: `numpy`, `scipy`, `pandas`
 - For NetCDF4 export (`merge_to_nc.py`): `xarray`, `netCDF4`
 
 PDK model paths are configured at the top of `run_lut_char_all.py`.
@@ -85,6 +85,119 @@ python run_lut_char_all.py --device gf180:nfet_03v3 --output-dir /mnt/data/lut_o
 # Merge all per-(corner, temp) .mat files into a single labelled NetCDF4 file
 python merge_to_nc.py --input-dir output/ --output-dir output/
 ```
+
+## Spectre-only BSIM-CMG characterization
+
+The Spectre backend is selected with `"simulator": "spectre"` in an external
+device JSON. It requires `--cap-matrix --uniform-grid` and uses standalone
+Spectre PSF ASCII output; MATLAB and Ocean are not required. The backend runs
+one nested VDS/VGS DC sweep and a separate 1 Hz noise sweep per
+`(device, corner, temperature, L, VSB)` slice. It saves the signed total
+Matrix9, DC fields, native `VDSSAT`, required `STH`/`SFL`, and native
+`CJDT`/`CJST`; additional native parasitic and saturation fields can be mapped
+in the device JSON. A partial or unreadable sweep fails the job. Completed
+slices are cached under `sim/` for restart.
+
+The [public example config](examples/tsmc16_spectre.example.json) follows the
+LVT NFET/PFET geometry and model names in the cited MATLAB starter file. Copy
+it to **remote protected storage**, then replace the example model paths,
+corner sections, geometry, legal voltage ranges, and signal names using the
+working PDK testbench. Do not put NDA paths, netlists, model contents, or
+result files in this repository. The config's `vdd` sets the endpoint for
+`--vsb-points`; eight points therefore span 0 to `-vdd` internally and are
+stored as positive VSB magnitudes. The remote safe-operating-area check must
+approve that full body-bias range before production. The referenced MATLAB
+example itself uses only 0 to 0.1 V VSB.
+
+Load the site's Spectre module and set the model paths and run locations to
+protected storage. For the public example JSON, the required shell variables
+are `TSMC16_MODEL_TOP`, `TSMC16_MODEL_USAGE`, `TSMC16_CFG`, and
+`LUT_RUN_ROOT`. From the repository root, set them to the site's actual paths
+before running the commands below:
+
+```bash
+export TSMC16_MODEL_TOP=/protected/pdk/toplevel.scs
+export TSMC16_MODEL_USAGE=/protected/pdk/usage.scs
+export TSMC16_CFG=/protected/tsmc16_spectre.json
+export LUT_RUN_ROOT=/protected/tsmc16_luts
+```
+
+Copy the example JSON to `TSMC16_CFG` and edit it for the remote deck. Once the
+Spectre module is loaded, run:
+
+```bash
+# End-to-end smoke: first mapped corner, 27 C, one L and VGS, full VDS and VSB.
+python run_lut_char_all.py \
+  --device-config "$TSMC16_CFG" --device tsmc16:nch_lvt pch_lvt \
+  --cap-matrix --uniform-grid --vgs-step 0.005 --vds-step 0.005 \
+  --vsb-points 8 --smoke --workers 1 \
+  --sim-dir "$LUT_RUN_ROOT/sim" --output-dir "$LUT_RUN_ROOT/output"
+
+# Corner/temperature gate: one L, one VGS, full VDS, VSB=0 for both devices.
+python run_lut_char_all.py \
+  --device-config "$TSMC16_CFG" --device tsmc16:nch_lvt pch_lvt \
+  --cap-matrix --uniform-grid --vgs-step 0.005 --vds-step 0.005 \
+  --vsb-points 1 --smoke --corners TT FF SS SF FS --temps -40 27 125 \
+  --workers 1 --sim-dir "$LUT_RUN_ROOT/corner_gate/sim" \
+  --output-dir "$LUT_RUN_ROOT/corner_gate/output"
+
+# Timed production-grid slice: one device, one corner/temp, one L and VSB.
+python run_lut_char_all.py \
+  --device-config "$TSMC16_CFG" --device tsmc16:nch_lvt \
+  --cap-matrix --uniform-grid --vgs-step 0.005 --vds-step 0.005 \
+  --vsb-points 1 --corners TT --temps 27 --l-range 0:1 --workers 1 \
+  --sim-dir "$LUT_RUN_ROOT/pilot/sim" --output-dir "$LUT_RUN_ROOT/pilot/output"
+
+# Full TSMC16 characterization: 5 mV VGS/VDS, 8 VSB, 5 corners, 3 temperatures.
+python run_lut_char_all.py \
+  --device-config "$TSMC16_CFG" --device tsmc16:nch_lvt pch_lvt \
+  --cap-matrix --uniform-grid --vgs-step 0.005 --vds-step 0.005 \
+  --vsb-points 8 --corners TT FF SS SF FS --temps -40 27 125 \
+  --corners-per-batch 1 --workers 1 \
+  --sim-dir "$LUT_RUN_ROOT/sim" --output-dir "$LUT_RUN_ROOT/output"
+
+# Export only after every requested PVT MAT file is present.
+python merge_to_nc.py \
+  --input-dir "$LUT_RUN_ROOT/output/uniform" \
+  --output-dir "$LUT_RUN_ROOT/output/uniform" \
+  --expect-devices nch_lvt_mac pch_lvt_mac \
+  --expect-corners TT FF SS SF FS --expect-temps -40 27 125
+```
+
+Before production, confirm the Spectre license and model includes, all mapped
+corners and temperatures, legal L/NFIN/NF values, and the full VSB range.
+Inspect both smoke MAT files for finite Matrix9 and saturation values,
+nonnegative 1 Hz noise PSD, and native junction terms. Compare native total
+capacitances against an independent low-frequency AC admittance check at
+representative biases. Keep `spectre_cap_junction_mode="native_total"` if the
+reported CDD/CSS include junction capacitance; select `"add_junction"` only
+when that check shows the junction branch is absent. This prevents counting
+`CJDT`/`CJST` twice. If the deck lacks any required field, stop and correct
+the signal map or scope before the dense run.
+
+The example maps native `VDSSAT`, which the public starter does not save. If
+the remote deck also exposes a distinct native `vdsat`, add
+`"VDSAT": "m0:vdsat"` to each device's `spectre_sat_signals` before the smoke
+run; the saved MAT and NetCDF files will then contain both. Do not map VDSAT
+to VDSSAT as an alias. `CJDT`, `CJST`, and `CGE` are saved separately from the
+normalized Matrix9. Additional native parasitic fields can be added to
+`spectre_parasitic_signals` after confirming their exact Spectre names in the
+remote operating-point output. The current NetCDF exporter also carries
+`CGDEXT`, `CGSEXT`, `CGBOV`, and `CFGEO` when mapped; other custom fields
+remain in the per-PVT MAT files until added to the export key list.
+
+The first remote smoke is the acceptance test for the site's Spectre PSF ASCII
+layout and device operating-point names. The backend checks trace counts,
+VGS/VDS/VSB order, numeric values, required noise contributions, and the 1 Hz
+frequency when present. A mismatch stops before writing a MAT file; inspect
+the slice's `techsweep.log` and `techsweep.raw` under the chosen simulation
+directory, then update the protected signal map or parser before production.
+
+At the example's 1.0 V limit, four lengths, eight VSB points, five corners,
+three temperatures, and two devices, a 5 mV grid has about **38.8 million
+bias points**, each with DC and noise data. Use the timed slice to estimate
+runtime and raw disk space. The NetCDF exporter writes one PVT file at a time
+to avoid allocating the complete collection in memory.
 
 ## Signed Capacitance Matrix (opt-in)
 

@@ -117,7 +117,10 @@ def test_matrix_parser_writes_nine_fields_and_schema_metadata(tmp_path):
 def test_smoke_uses_first_available_corner_when_tt_is_absent(tmp_path, monkeypatch):
     cfg = _cmg_cfg(lib_corner_map={"TYP": "typ"})
     jobs = []
-    monkeypatch.setattr(runner, "_run_one_pvt", lambda job: jobs.append(job))
+    def record(job):
+        jobs.append(job)
+        return (job[1], job[2], "mock.mat")
+    monkeypatch.setattr(runner, "_run_one_pvt", record)
     runner.run_pvt(
         cfg, ["TYP"], [27], smoke_mode=True, max_workers=1,
         base_sim_dir=tmp_path / "sim", base_out_dir=tmp_path / "out",

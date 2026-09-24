@@ -15,6 +15,7 @@ Example:
 """
 
 import argparse
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import scipy.io
 import xarray as xr
+from netCDF4 import Dataset
 
 from capacitance import CAP_PROFILE_LEGACY, CAP_PROFILE_MATRIX9, LEGACY_CAP_KEYS, MATRIX9_KEYS
 
@@ -30,12 +32,16 @@ from capacitance import CAP_PROFILE_LEGACY, CAP_PROFILE_MATRIX9, LEGACY_CAP_KEYS
 CORNER_ORDER = ["TT", "FF", "SS", "SF", "FS"]
 
 CORE_DATA_KEYS = ("ID", "VT", "GM", "GMB", "GDS")
-OPTIONAL_DATA_KEYS = ("STH", "SFL", "VDSAT")
+OPTIONAL_DATA_KEYS = (
+    "STH", "SFL", "VDSAT", "VDSSAT", "IGD", "IGS", "CGE",
+    "CJDT", "CJST", "CGDEXT", "CGSEXT", "CGBOV", "CFGEO",
+)
 DATA_KEYS = list(CORE_DATA_KEYS + LEGACY_CAP_KEYS + OPTIONAL_DATA_KEYS)
 PROFILE_METADATA_KEYS = (
     "CAPACITANCE_PROFILE", "CAPACITANCE_SCHEMA_VERSION",
     "CAPACITANCE_CONVENTION", "CAPACITANCE_TERMINALS",
     "CAPACITANCE_COMPONENTS", "MODEL_FAMILY", "BULK_TERMINAL_ALIAS",
+    "CAPACITANCE_JUNCTION_MODE", "NOISE_FREQ_HZ", "SIMULATOR",
 )
 
 # Matches: {device}_{corner}_T{p|m}{abs_temp}{grid_suffix}.mat
@@ -47,7 +53,7 @@ PROFILE_METADATA_KEYS = (
 # Partial-L files (e.g. _L280to600nm.mat) are excluded by the separate
 # _L\d+to\d+nm check in collect_files.
 _FILE_RE = re.compile(
-    r'^(?P<device>.+?)_(?P<corner>TT|FF|SS|SF|FS)_T(?P<tsign>[pm])(?P<tval>\d+)'
+    r'^(?P<device>.+)_(?P<corner>[A-Za-z0-9]+)_T(?P<tsign>[pm])(?P<tval>\d+)'
     r'(?P<suffix>(?:_uvgs[\d.]+mV_uvds[\d.]+mV)?(?:_vsb\d+)?)'
     r'(?P<profile>_cm9)?'
     r'\.mat$'
@@ -83,7 +89,10 @@ def collect_files(input_dir: Path, device_filter=None):
         # Group separately per grid-suffix so different sweeps don't collide
         # in the output .nc filename.
         device_key = f"{device}{suffix}{profile_suffix}"
-        by_device.setdefault(device_key, {})[corner, temp] = path
+        group = by_device.setdefault(device_key, {})
+        if (corner, temp) in group:
+            raise ValueError(f"duplicate PVT files: {group[corner, temp]} and {path}")
+        group[corner, temp] = path
 
     return by_device
 
@@ -98,6 +107,8 @@ def load_mat(path: Path) -> dict:
 
 
 def _scalar(value):
+    if value is None:
+        return None
     arr = np.asarray(value)
     return arr.flat[0].item() if arr.size else None
 
@@ -230,6 +241,85 @@ def build_dataset(files_by_ct: dict, device_name: str) -> xr.Dataset:
     return ds
 
 
+def export_group_streaming(files_by_ct: dict, device_name: str, out_path: Path,
+                           expected_corners=None, expected_temps=None) -> None:
+    """Write one PVT at a time so dense Spectre collections fit in memory."""
+    found_corners = {corner for corner, _ in files_by_ct}
+    found_temps = {temp for _, temp in files_by_ct}
+    corners = ([c for c in CORNER_ORDER if c in found_corners]
+               + sorted(found_corners - set(CORNER_ORDER)))
+    temps = sorted(found_temps)
+    if expected_corners is not None:
+        if set(expected_corners) != found_corners:
+            raise ValueError(f"corner set {sorted(found_corners)} != expected {expected_corners}")
+        corners = list(expected_corners)
+    if expected_temps is not None:
+        if set(expected_temps) != found_temps:
+            raise ValueError(f"temperature set {temps} != expected {expected_temps}")
+        temps = list(expected_temps)
+    missing = {(c, t) for c in corners for t in temps} - set(files_by_ct)
+    if missing:
+        raise ValueError(f"missing PVT files: {sorted(missing)}")
+
+    first_path = next(iter(files_by_ct.values()))
+    first = load_mat(first_path)
+    keys = _data_keys(first)
+    axes = {
+        axis: np.unique(np.asarray(first[axis], dtype=float).ravel()) if axis == "VSB"
+        else np.atleast_1d(np.asarray(first[axis], dtype=float))
+        for axis in ("L", "VGS", "VDS", "VSB")
+    }
+    shape = tuple(len(axes[axis]) for axis in axes)
+    dims = ("corner", "temp", "L", "VGS", "VDS", "VSB")
+    tmp_path = out_path.with_name("." + out_path.name + ".tmp")
+    try:
+        with Dataset(tmp_path, "w", format="NETCDF4") as nc:
+            nc.createDimension("corner", len(corners))
+            nc.createDimension("temp", len(temps))
+            for axis in axes:
+                nc.createDimension(axis, len(axes[axis]))
+            nc.createVariable("corner", str, ("corner",))[:] = np.asarray(corners, dtype=object)
+            nc.createVariable("temp", "i4", ("temp",))[:] = temps
+            for axis, values in axes.items():
+                nc.createVariable(axis, "f8", (axis,))[:] = values
+            variables = {
+                key: nc.createVariable(key, "f8", dims, zlib=True, complevel=4,
+                                       shuffle=True, fill_value=np.nan,
+                                       chunksizes=(1, 1, 1, min(shape[1], 64),
+                                                   min(shape[2], 64), 1))
+                for key in keys
+            }
+            nc.setncattr("device", device_name)
+            nc.setncattr("W", float(_scalar(first.get("W", np.nan))))
+            nc.setncattr("NFING", float(_scalar(first.get("NFING", np.nan))))
+            if "NF" in first:
+                nc.setncattr("NF", float(_scalar(first["NF"])))
+            nc.setncattr("created", datetime.now(timezone.utc).isoformat())
+            for meta_key in PROFILE_METADATA_KEYS:
+                value = _scalar(first.get(meta_key))
+                if value is not None:
+                    nc.setncattr(meta_key, value)
+            for ci, corner in enumerate(corners):
+                for ti, temp in enumerate(temps):
+                    path = files_by_ct[corner, temp]
+                    data = load_mat(path)
+                    if _data_keys(data) != keys:
+                        raise ValueError(f"{path}: tensor keys differ from {first_path}")
+                    for meta_key in PROFILE_METADATA_KEYS:
+                        if _scalar(data.get(meta_key)) != _scalar(first.get(meta_key)):
+                            raise ValueError(f"{path}: metadata {meta_key} differs from {first_path}")
+                    for axis, expected in axes.items():
+                        actual = (np.unique(np.asarray(data[axis], dtype=float).ravel())
+                                  if axis == "VSB" else np.atleast_1d(np.asarray(data[axis], dtype=float)))
+                        if actual.shape != expected.shape or not np.allclose(actual, expected):
+                            raise ValueError(f"{path}: {axis} grid differs from {first_path}")
+                    for key in keys:
+                        variables[key][ci, ti, :, :, :, :] = _as_tensor(data, key, shape)
+        os.replace(tmp_path, out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Merge per-(corner, temp) .mat LUT files into one NetCDF4 file per device.",
@@ -242,6 +332,12 @@ def main():
                     help="Directory for output .nc files (default: output/)")
     ap.add_argument("--device", default=None, metavar="PATTERN",
                     help="Optional substring filter on device name (e.g. nfet_03v3)")
+    ap.add_argument("--expect-corners", nargs="+", metavar="CORNER",
+                    help="Require these corners and every corner-temperature combination")
+    ap.add_argument("--expect-temps", nargs="+", type=int, metavar="TEMP",
+                    help="Require these temperatures and every corner-temperature combination")
+    ap.add_argument("--expect-devices", nargs="+", metavar="DEVICE",
+                    help="Require exactly these base device names in the input collection")
     args = ap.parse_args()
 
     input_dir  = Path(args.input_dir)
@@ -255,9 +351,19 @@ def main():
     by_device = collect_files(input_dir, device_filter=args.device)
 
     if not by_device:
+        if args.expect_corners or args.expect_temps or args.expect_devices:
+            sys.exit("No matching .mat files found for the required collection.")
         print("No matching .mat files found.")
         return
+    if args.expect_devices:
+        found_devices = {
+            _FILE_RE.match(next(iter(files.values())).name).group("device")
+            for files in by_device.values()
+        }
+        if found_devices != set(args.expect_devices):
+            sys.exit(f"Device set {sorted(found_devices)} != expected {args.expect_devices}")
 
+    failures = 0
     for device_name, files_by_ct in sorted(by_device.items()):
         corners_found = sorted({c for c, _ in files_by_ct})
         temps_found   = sorted({t for _, t in files_by_ct})
@@ -267,24 +373,19 @@ def main():
         print(f"  Temps   : {temps_found}")
 
         try:
-            ds = build_dataset(files_by_ct, device_name)
+            out_path = output_dir / f"{device_name}.nc"
+            export_group_streaming(files_by_ct, device_name, out_path,
+                                   args.expect_corners, args.expect_temps)
         except Exception as exc:
-            print(f"  [ERROR] Failed to build dataset: {exc}", file=sys.stderr)
+            print(f"  [ERROR] Failed to export dataset: {exc}", file=sys.stderr)
+            failures += 1
             continue
-
-        out_path = output_dir / f"{device_name}.nc"
-        encoding = {
-            name: {"zlib": True, "complevel": 4, "shuffle": True}
-            for name in ds.data_vars
-        }
-        ds.to_netcdf(str(out_path), encoding=encoding)
         print(f"  Written : {out_path}")
-        print(f"  Shape   : corner={ds.sizes['corner']}  temp={ds.sizes['temp']}  "
-              f"L={ds.sizes['L']}  VGS={ds.sizes['VGS']}  "
-              f"VDS={ds.sizes['VDS']}  VSB={ds.sizes['VSB']}")
-        print(f"  Vars    : {sorted(ds.data_vars)}")
+        print(f"  PVT files: {len(files_by_ct)}")
 
     print("\nDone.")
+    if failures:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
