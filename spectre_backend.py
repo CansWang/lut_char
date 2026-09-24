@@ -156,6 +156,9 @@ def _sweep(name: str, analysis: str, start: float, stop: float, step: float) -> 
 
 def make_netlist(cfg, corner: str, temp: int, length: float, vsb: float,
                  vgs: np.ndarray, vds: np.ndarray, raw_dir: Path) -> str:
+    if len(vgs) < 2 or len(vds) < 2:
+        raise ValueError(
+            "Spectre nested DC/noise sweeps require at least two VGS and two VDS points")
     if len(vgs) > 1 and not np.allclose(np.diff(vgs), np.diff(vgs)[0], atol=1e-9):
         raise ValueError("Spectre requires a uniform VGS grid")
     if len(vds) > 1 and not np.allclose(np.diff(vds), np.diff(vds)[0], atol=1e-9):
@@ -336,7 +339,11 @@ def run_spectre_job(cfg, corner: str, temp: int, l_vec, vsb_vec, vgs_vec,
                                                 env={**os.environ, **cfg.simulation_env},
                                                 timeout=cfg.spectre_timeout_s, check=False)
                     if result.returncode:
-                        raise RuntimeError(f"Spectre failed ({result.returncode}); see {log_path}")
+                        log_tail = "\n".join(
+                            log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-30:])
+                        raise RuntimeError(
+                            f"Spectre failed ({result.returncode}); see {log_path}\n"
+                            f"Last 30 log lines:\n{log_tail}")
                 dc = read_psfascii(_dataset(raw_dir, "sweepvds", "sweepvgs"))
                 noise = read_psfascii(_dataset(raw_dir, "sweepvds_noise", "sweepvgs_noise"))
                 _validate_bias_traces(cfg, dc, np.asarray(vgs_vec), np.asarray(vds_vec), abs(vsb))

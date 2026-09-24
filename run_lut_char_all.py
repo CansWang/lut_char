@@ -1403,15 +1403,22 @@ def _test_grids(cfg: DevCfg):
     return l_t, vgs_t, vsb_t
 
 
-def _smoke_grids(cfg: DevCfg):
+def _smoke_grids(cfg: DevCfg, vgs_grid=None):
     """Return (l_vec, vgs_override, vsb_vec) for the ultra-fast smoke test.
-    Uses a single L (first), single VGS (near 60% of fine_max), full vsb_vec.
+    Spectre needs two VGS values because its nested noise sweep rejects equal
+    start/stop limits; ngspice retains the original one-point smoke grid.
     """
     l_vec = [cfg.l_vec[0]]
-    vgs_all = build_vgs_all(cfg.vgs_max)
-    n_fine  = _n_vgs_fine(cfg.vgs_max)
-    i_mid   = max(0, int(n_fine * 0.6) - 1)
+    vgs_all = np.asarray(vgs_grid if vgs_grid is not None
+                         else build_vgs_all(cfg.vgs_max), dtype=float)
+    target = 0.6 * _vgs_fine_max(cfg.vgs_max)
+    i_mid = int(np.argmin(np.abs(vgs_all - target)))
     vgs_vec = [float(vgs_all[i_mid])]
+    if cfg.simulator == "spectre":
+        if len(vgs_all) < 2:
+            raise ValueError(f"{cfg.key}: Spectre smoke requires at least two VGS points")
+        i_adjacent = i_mid + 1 if i_mid + 1 < len(vgs_all) else i_mid - 1
+        vgs_vec = sorted([float(vgs_all[i_mid]), float(vgs_all[i_adjacent])])
     vsb_vec = list(cfg.vsb_vec)
     return l_vec, vgs_vec, vsb_vec
 
@@ -1432,8 +1439,8 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
                        distribute L-range work across machines; use merge_mats.py to
                        combine the resulting partial .mat files afterward.
     test_mode        : run a micro-sweep (2L × 2VGS × 1VSB, TT/27°C) for validation.
-    smoke_mode       : small smoke test (1L × 1VGS × fullVDS × all selected VSB,
-                       corners, and temperatures).
+    smoke_mode       : small smoke test (1L × 1VGS for ngspice or 2VGS for
+                       Spectre × fullVDS × all selected VSB/corners/temps).
     corners_per_batch: number of corners to run in each sequential batch.
     uniform_grid     : use uniform grids for both VGS and VDS (steps below).
     vgs_step/vds_step: uniform VGS/VDS step in volts (default 25 mV). Only used
@@ -1498,7 +1505,7 @@ def run_pvt(cfg: DevCfg, corners, temps, l_vec=None, test_mode=False,
                               vgs_step, vds_step, base_sim_dir, base_out_dir,
                               cap_matrix)])]
     elif smoke_mode:
-        l_s, vgs_s, vsb_s = _smoke_grids(cfg)
+        l_s, vgs_s, vsb_s = _smoke_grids(cfg, vgs_vec)
         batches = [("smoke", [
             (cfg, corner, temp, l_s, vsb_s, vgs_s, False, uniform_grid,
              vgs_step, vds_step, base_sim_dir, base_out_dir, cap_matrix)
@@ -1595,7 +1602,7 @@ def main():
     ap.add_argument("--test-run", action="store_true",
                     help="Micro-sweep validation (2 L, 2 VGS, 1 VSB, TT/27°C)")
     ap.add_argument("--smoke", action="store_true",
-                    help="Small smoke test: 1L × 1VGS × fullVDS × all selected VSB. "
+                    help="Small smoke test: 1L × 1VGS (2 for Spectre) × fullVDS × all selected VSB. "
                          "Defaults to TT/27°C; --corners and --temps extend the PVT gate.")
     ap.add_argument("--corners", nargs="+", metavar="CORNER",
                     help="Override corners (default: all available for device)")

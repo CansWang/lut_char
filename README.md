@@ -126,14 +126,14 @@ Copy the example JSON to `TSMC16_CFG` and edit it for the remote deck. Once the
 Spectre module is loaded, run:
 
 ```bash
-# End-to-end smoke: first mapped corner, 27 C, one L and VGS, full VDS and VSB.
+# End-to-end smoke: first mapped corner, 27 C, one L, two VGS, full VDS and VSB.
 python run_lut_char_all.py \
   --device-config "$TSMC16_CFG" --device tsmc16:nch_lvt pch_lvt \
   --cap-matrix --uniform-grid --vgs-step 0.005 --vds-step 0.005 \
   --vsb-points 8 --smoke --workers 1 \
   --sim-dir "$LUT_RUN_ROOT/sim" --output-dir "$LUT_RUN_ROOT/output"
 
-# Corner/temperature gate: one L, one VGS, full VDS, VSB=0 for both devices.
+# Corner/temperature gate: one L, two VGS, full VDS, VSB=0 for both devices.
 python run_lut_char_all.py \
   --device-config "$TSMC16_CFG" --device tsmc16:nch_lvt pch_lvt \
   --cap-matrix --uniform-grid --vgs-step 0.005 --vds-step 0.005 \
@@ -355,11 +355,11 @@ Three modes are available for validating and profiling the pipeline before commi
 
 | Flag | L | VGS | VSB | Temps | Corners | Validates? | Approx time |
 |------|---|-----|-----|-------|---------|------------|-------------|
-| `--smoke` | 1 | 1 | all (respects `--vsb-points`) | 27°C | TT | No | ~10–30 s × nVSB |
+| `--smoke` | 1 | 1 ngspice / 2 Spectre | all (respects `--vsb-points`) | 27°C | TT | No | ~10–30 s × nVSB |
 | `--test-run` | 2 | 2 | VSB=0 only | 27°C | TT | Yes (TC1–4) | ~1–5 min |
 | *(full run)* | all | all | all | 3 | all 5 | No | hours–days |
 
-- **`--smoke`**: one ngspice call per VSB point; confirms the pipeline runs end-to-end without crashing. Uses the full `vsb_vec` so `--vsb-points` is exercised.
+- **`--smoke`**: confirms the pipeline runs end-to-end. It uses one VGS point for ngspice and two adjacent points for Spectre because Spectre rejects a nested noise sweep whose start and stop are equal. The full `vsb_vec` exercises `--vsb-points`.
 - **`--test-run`**: micro-sweep (VSB=0 only) with TC validation checks (transconductance continuity, noise floor, etc.).
 
 ## Concurrency Control

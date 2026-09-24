@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from scipy.io import loadmat
 
 import run_lut_char_all as runner
@@ -126,3 +127,11 @@ def test_smoke_uses_first_available_corner_when_tt_is_absent(tmp_path, monkeypat
         base_sim_dir=tmp_path / "sim", base_out_dir=tmp_path / "out",
     )
     assert jobs[0][1] == "TYP"
+
+
+def test_spectre_smoke_uses_two_adjacent_uniform_vgs_points():
+    cfg = _cmg_cfg(simulator="spectre")
+    grid = runner.build_uniform_vgs(cfg.vgs_max, 0.005)
+    _, smoke_vgs, _ = runner._smoke_grids(cfg, grid)
+    assert len(smoke_vgs) == 2
+    assert smoke_vgs[1] - smoke_vgs[0] == pytest.approx(0.005)

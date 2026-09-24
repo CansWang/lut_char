@@ -48,6 +48,13 @@ def test_psfascii_reads_scalar_and_struct_noise(tmp_path):
     np.testing.assert_allclose(data["m0:flicker"], [2e-25, 4e-25])
 
 
+def test_spectre_netlist_rejects_singleton_nested_sweep(tmp_path):
+    with pytest.raises(ValueError, match="at least two VGS and two VDS"):
+        spectre.make_netlist(cfg(), "TT", 27, 0.016, 0.0,
+                             np.array([0.3]), np.array([0.0, 0.5]),
+                             tmp_path / "raw")
+
+
 def test_spectre_job_makes_complete_matrix_lut(tmp_path, monkeypatch):
     conf = cfg()
     monkeypatch.setattr(spectre.shutil, "which", lambda executable: "/bin/spectre")
